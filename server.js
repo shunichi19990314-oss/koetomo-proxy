@@ -161,8 +161,9 @@ function parseRelayConfig() {
 const RELAY = parseRelayConfig();
 
 let _relayDispatcher = null;
-/** 上流 fetch 用の undici ProxyAgent(リレー未設定なら undefined=直接接続) */
+/** 上流 fetch 用の dispatcher(リレー=ProxyAgent / トンネル=Agent+connect / 未設定=undefined で直接接続) */
 function upstreamDispatcher() {
+  if (TUNNEL) return tunnelDispatcher();
   if (!RELAY) return undefined;
   if (!_relayDispatcher) {
     _relayDispatcher = new ProxyAgent({
@@ -229,6 +230,92 @@ function tlsWrapSocket(socket, servername) {
     const secure = tls.connect({ socket, servername }, () => resolve(secure));
     secure.once("error", reject);
   });
+}
+
+// ──────────────── リバーストンネル(クレカ不要・ポート開放不要の日本出口) ────────────────
+//
+// RELAY_URL 方式は「日本のサーバにポート開放して待たせる」形なので、グローバルIPと
+// クレジットカード(クラウド利用)が必要になります。こちらの TUNNEL 方式は逆で、
+// 日本のマシン(自宅PC / Raspberry Pi など)から【外向き】に WebSocket を張らせるため、
+//   ・ポート開放不要(CGNAT でも可)
+//   ・クラウド不要=クレジットカード不要
+// で日本の出口を作れます。待ち合わせは tunnel/hub.js(このプロセスに内蔵)。
+//
+//   ブラウザ → Render(server.js) → ハブ(/__tunnel) → 日本のマシン → koetomo.fun
+//
+// 環境変数:
+//   TUNNEL_TOKEN  共有シークレット(未設定ならトンネル機能は無効=従来動作)
+//   TUNNEL_MODE   "embed"(既定: このプロセス内蔵) / "off"(内蔵ハブを停止)
+//   TUNNEL_PATH   WS エンドポイント(既定 /__tunnel)
+//
+// 日本側は relay/reverse-tunnel.js を起動するだけ(詳細は relay/README.md)。
+
+const { attachHub } = require("./tunnel/hub");
+const { openTunnelSocket, tlsWrapTunnel } = require("./tunnel/tunnel-bridge");
+
+const TUNNEL_TOKEN = (process.env.TUNNEL_TOKEN || "").trim();
+const TUNNEL_MODE = String(process.env.TUNNEL_MODE || "embed").toLowerCase();
+const TUNNEL = TUNNEL_TOKEN && TUNNEL_MODE !== "off"
+  ? { token: TUNNEL_TOKEN, path: process.env.TUNNEL_PATH || "/__tunnel", label: "リバーストンネル(日本のマシン出口)" }
+  : null;
+const hub = TUNNEL ? attachHub(null, { path: TUNNEL.path }) : null;
+
+/** トンネル経由の上流接続を作る(HTTP はそのまま、HTTPS はここで TLS を張る) */
+async function tunnelConnect(opts) {
+  const socket = await openTunnelSocket({
+    hubUrl: "ws://127.0.0.1:" + PORT + TUNNEL.path,   // 内蔵ハブは自分自身(ループバック)
+    token: TUNNEL.token,
+    host: opts.hostname,
+    port: opts.port,
+    timeoutMs: 25_000,
+  });
+  if (opts.protocol === "https:") return tlsWrapTunnel(socket, opts.servername || opts.hostname, {});
+  return socket;
+}
+
+let _tunnelAgent = null;
+/** トンネルモードの undici Agent。リクエストごとに新しいトンネルを掘る(再利用しない) */
+function tunnelDispatcher() {
+  if (!TUNNEL) return null;
+  if (!_tunnelAgent) {
+    const { Agent } = require("undici");
+    _tunnelAgent = new Agent({
+      connect: async (opts, cb) => {
+        // undici は既定ポートを port:"" で渡してくるため、protocol から補完する
+        const protocol = opts.protocol || "https:";
+        const port = Number(opts.port) || (protocol === "https:" ? 443 : 80);
+        try {
+          const socket = await tunnelConnect({
+            hostname: opts.hostname || opts.host,
+            port,
+            protocol,
+            servername: opts.servername || opts.hostname || opts.host,
+          });
+          cb(null, socket);
+        } catch (err) {
+          if (process.env.TUNNEL_DEBUG === "1") log("tunnel connect error:", err && err.stack ? err.stack.split("\n").slice(0, 4).join(" | ") : err);
+          cb(err, null);
+        }
+      },
+      connections: 16,          // 同時トンネル数(1リクエスト=1トンネル)
+      pipelining: 0,            // トンネルの再利用はしない(応答境界の判定が不要になる)
+      keepAliveTimeout: 10,     // 応答完了後すぐにトンネルを閉じて次は新規に掘る
+      keepAliveMaxTimeout: 20,
+      headersTimeout: 60_000,
+      bodyTimeout: 300_000,
+      connectTimeout: 30_000,
+    });
+  }
+  return _tunnelAgent;
+}
+
+/** 上流への経路が「日本出口」になっているか(リレー or トンネル) */
+const HAS_JP_EGRESS = Boolean(RELAY || TUNNEL);
+/** /__status 等に表示する経路ラベル */
+function egressLabel() {
+  if (RELAY) return "リレー経由: " + RELAY.label;
+  if (TUNNEL) return "リバーストンネル経由(日本のマシン出口)";
+  return "直接接続(日本出口なし)";
 }
 
 const _upCache = new Map();    // 応答用: 上流ホスト → プロキシオリジン
@@ -406,17 +493,17 @@ ${bodyHtml}
 
 function sendBlockedPage(req, res, upRes, origin) {
   const server = upRes.headers.get("server") || "(不明)";
-  const advice = RELAY ? `
+  const advice = HAS_JP_EGRESS ? `
   <h2>考えられる原因(リレー経由)</h2>
   <ul>
-    <li>リレーの出口IPが<b>日本以外</b>になっている(RELAY_URL の指定ミス、リレーが落ちている等)</li>
+    <li>日本出口のIPが<b>日本以外</b>になっている(設定ミス、日本のマシンが落ちている等)</li>
     <li>リレーの日本IP自体がブロック対象(プロバイダのIPレンジ単位での規制)</li>
     <li>上流側の一時的な障害・メンテナンス</li>
   </ul>
   <h2>対処</h2>
   <ol>
-    <li><a href="/__status"><b>/__status 診断ページ</b></a> で「リレーの出口IP」が日本 (JP) になっているか確認する</li>
-    <li>リレーサーバを再起動して出口IPを変える / 別の日本サーバ(別プロバイダ)に切り替える</li>
+    <li><a href="/__status"><b>/__status 診断ページ</b></a> で「日本出口のIP」が日本 (JP) になっているか確認する</li>
+    <li>${TUNNEL ? "日本のマシンで relay/reverse-tunnel.js が動いているか(ログに ✅ オンライン登録完了 が出るか)確認する" : "リレーサーバを再起動して出口IPを変える / 別の日本サーバ(別プロバイダ)に切り替える"}</li>
     <li>時間をおいて再試行する</li>
   </ol>` : `
   <h2>原因</h2>
@@ -426,21 +513,21 @@ function sendBlockedPage(req, res, upRes, origin) {
   </ul>
   <h2>対処 — 「日本の出口リレー」を追加してください</h2>
   <ol>
-    <li>リポジトリの <b>relay/README.md</b> の手順で、日本の無料サーバ(Oracle Cloud Always Free 東京/大阪 など)に中継プロキシを1つ立てる(約15分)</li>
-    <li>Render の環境変数に <code>RELAY_URL</code>(と <code>RELAY_CA_B64</code>)を設定して再デプロイ</li>
+    <li>リポジトリの <b>relay/README.md</b>「方法A: リバーストンネル」の手順で、<b>日本にある自分のマシン</b>(自宅PC / Raspberry Pi など・クレジットカード不要・ポート開放不要)を出口にする</li>
+    <li>Render の環境変数に <code>TUNNEL_TOKEN</code> を設定 → 日本のマシンで <code>HUB_URL=wss://このドメイン/__tunnel TUNNEL_TOKEN=同じ値 node relay/reverse-tunnel.js</code> を起動</li>
     <li><a href="/__status"><b>/__status 診断ページ</b></a> で ✅「上流に受け入れられています」になることを確認する</li>
   </ol>`;
   const body = htmlPage("403 — 声とも側でブロックされています", `
 <div class="card">
   <h1>🚫 403 Forbidden — 上流「声とも」がこのプロキシのアクセスを拒否しました</h1>
-  <div class="verdict bad">koetomo.fun のサーバ (${escHtml(server)}) が、HTTP 403 を返しています。<br>プロキシ自体は正常に動作しています。${RELAY ? "リレーの出口IPが拒否されています。" : "これは<b>日本国外IPに対する地域ブロック</b>です。"}</div>
+  <div class="verdict bad">koetomo.fun のサーバ (${escHtml(server)}) が、HTTP 403 を返しています。<br>プロキシ自体は正常に動作しています。${HAS_JP_EGRESS ? "日本出口のIPが拒否されています。" : "これは<b>日本国外IPに対する地域ブロック</b>です。"}</div>
   ${advice}
   <h2>リクエスト詳細</h2>
   <table>
     <tr><th>パス</th><td>${escHtml(req.method + " " + req.url)}</td></tr>
     <tr><th>上流ステータス</th><td>${upRes.status}</td></tr>
     <tr><th>上流 Server</th><td>${escHtml(server)}</td></tr>
-    <tr><th>経路</th><td>${RELAY ? "リレー経由: " + escHtml(RELAY.label) : "直接接続(リレー未設定)"}</td></tr>
+    <tr><th>経路</th><td>${escHtml(egressLabel())}</td></tr>
     <tr><th>プロキシのオリジン</th><td>${escHtml(origin)}</td></tr>
     <tr><th>時刻</th><td>${escHtml(nowJa())}</td></tr>
   </table>
@@ -539,7 +626,7 @@ async function proxyHttp(req, res) {
   } catch (err) {
     if (res.headersSent || res.writableEnded) return res.destroy();
     if (err?.name === "AbortError") return; // クライアント側切断
-    log(`upstream error ${req.method} ${req.url}:`, err?.cause?.code || err?.message);
+    log(`upstream error ${req.method} ${req.url}:`, err?.cause?.code || err?.message, err?.cause?.message || "", err?.cause?.stack ? String(err.cause.stack).split("\n")[1] : "");
     return sendBadGateway(req, res, origin, err);
   }
 
@@ -653,10 +740,17 @@ function relayWebSocket(req, client) {
     maxPayload: 100 * 1024 * 1024,
   };
 
-  /** リレー設定時は CONNECT トンネル(wss はさらに TLS ラップ)を createConnection で ws に渡す */
+  /** 日本出口(リレー/トンネル)設定時は、その生ソケットを createConnection で ws に渡す */
   async function prepareConnection() {
-    if (!RELAY) return undefined;
+    if (!RELAY && !TUNNEL) return undefined;
     const upPort = Number(UP.port || (UP.protocol === "https:" ? 443 : 80));
+    if (TUNNEL) {
+      // リバーストンネル: TLS 込みで日本出口のソケットを作る
+      const sock = await tunnelConnect({
+        hostname: UP.hostname, port: upPort, protocol: UP.protocol, servername: UP.hostname,
+      });
+      return () => sock;
+    }
     let tunnel = await relayTunnel(UP.hostname, upPort);
     if (UP.protocol === "https:") {
       tunnel = await tlsWrapSocket(tunnel, UP.hostname);
@@ -695,7 +789,7 @@ function relayWebSocket(req, client) {
     up.on("open", () => {
       upOpen = true;
       for (const [data, isBinary] of queue.splice(0)) up.send(data, { binary: isBinary });
-      log(`ws opened ${req.url} -> ${UP_WS_ORIGIN}${RELAY ? " (via relay)" : ""}`);
+      log(`ws opened ${req.url} -> ${UP_WS_ORIGIN}${RELAY ? " (via relay)" : TUNNEL ? " (via tunnel)" : ""}`);
     });
 
     up.on("message", (data, isBinary) => {
@@ -780,7 +874,7 @@ function getEgressInfo() {
 
 /** リレー経由の出口IP(= koetomo.fun から実際に見える IP)。リレー未設定なら null(10分キャッシュ) */
 function getRelayEgressInfo() {
-  if (!RELAY) return Promise.resolve(null);
+  if (!HAS_JP_EGRESS) return Promise.resolve(null);
   const now = Date.now();
   if (_relayEgressCache.data && now - _relayEgressCache.at < IPINFO_CACHE_TTL) return Promise.resolve(_relayEgressCache.data);
   if (_relayEgressCache.promise) return _relayEgressCache.promise;
@@ -804,7 +898,8 @@ async function probeUpstream() {
     await r.body?.cancel().catch(() => {});
     return { ok: true, status: r.status, server: r.headers.get("server"), ms: Date.now() - t0, error: null };
   } catch (err) {
-    return { ok: false, status: null, server: null, ms: Date.now() - t0, error: err?.cause?.code || err?.name || err?.message || "unknown" };
+    const detail = err?.cause?.message || err?.message || "";
+    return { ok: false, status: null, server: null, ms: Date.now() - t0, error: err?.cause?.code || err?.name || err?.message || "unknown", detail: String(detail).slice(0, 200) };
   }
 }
 
@@ -812,17 +907,22 @@ function judgeUpstream(up, ip, relayIp) {
   const effective = relayIp || ip; // 声ともから実際に見える IP(リレー経由ならリレーの出口)
   const ipText = effective ? `${effective.ip}${effective.country ? " / " + (COUNTRY_JA[effective.country] || effective.country) : ""}` : "取得失败";
   if (!up.ok) {
-    const via = RELAY ? `リレー (${RELAY.label}) 経由でも` : "";
+    const via = RELAY ? `リレー (${RELAY.label}) 経由でも` : TUNNEL ? "リバーストンネル(日本のマシン)経由でも" : "";
+    const hint = RELAY
+      ? "リレーサーバが起動しているか・RELAY_URL/証明書の設定が正しいかを確認してください。"
+      : TUNNEL
+        ? `日本のマシンで relay/reverse-tunnel.js が起動しているかを確認してください(オンライン台数: ${hub ? hub.stats().relays.length : 0})。Render のスリープ中は接続が切れるため、/__status を開いてから数十秒待って再読み込みすると復活します。`
+        : "DNS 解決失敗・上流のダウン・タイムアウトのいずれかです。";
     return { level: "warn", icon: "⚠️", title: "上流に到達できません", ok: false,
-      detail: `${via}接続エラー (${up.error})。${RELAY ? "リレーサーバが起動しているか・RELAY_URL/証明書の設定が正しいかを確認してください。" : "DNS 解決失敗・上流のダウン・タイムアウトのいずれかです。"}` };
+      detail: `${via}接続エラー (${up.error})。${hint}` };
   }
   if (up.status === 403 || up.status === 401) {
-    if (RELAY) {
-      return { level: "bad", icon: "❌", title: `HTTP ${up.status} — リレーの出口IP (${ipText}) も拒否されています`, ok: false,
-        detail: `リレー経由で接続しましたが、声とも側のエッジ (${up.server || "?"}) がリレーの発信IPも拒否しています。リレーが日本以外のIPになっている(RELAY_URL の指定ミス)か、日本の当該IPレンジがブロックされている可能性があります。リレーを再起動してIPを変える / 別の日本サーバ(別プロバイダ)に切り替えてください。` };
+    if (HAS_JP_EGRESS) {
+      return { level: "bad", icon: "❌", title: `HTTP ${up.status} — 日本出口のIP (${ipText}) も拒否されています`, ok: false,
+        detail: `${egressLabel()}で接続しましたが、声とも側のエッジ (${up.server || "?"}) がその発信IPも拒否しています。日本出口が実際に日本IPになっているか上の表で確認してください(なっていなければ TUNNEL_TOKEN / RELAY_URL の設定ミスか、日本のマシンが接続できていません)。日本なのに 403 の場合は、そのプロバイダのIPレンジがブロックされている可能性があるので、別の回線/マシン(例: 携帯テザリング)に切り替えてください。` };
     }
     return { level: "bad", icon: "❌", title: `HTTP ${up.status} で拒否されています(日本国外IPの地域ブロック)`, ok: false,
-      detail: `声ともは日本国外のIPを一律拒否する地域制限を運用しており、Render の発信IP (${ipText}) は拒否されます。Render には日本リージョンが無いため、直接接続での解決は不可能です。relay/README.md の手順で「日本の出口リレー」(Oracle Cloud 無料枠 等)を立て、RELAY_URL を設定してください。` };
+      detail: `声ともは日本国外のIPを一律拒否する地域制限を運用しており、Render の発信IP (${ipText}) は拒否されます。Render には日本リージョンが無いため、直接接続での解決は不可能です。<b>relay/README.md</b> の「方法A: リバーストンネル(クレカ不要・ポート開放不要)」の手順で日本のマシンを出口にしてください。` };
   }
   if (up.status >= 500) {
     return { level: "warn", icon: "⚠️", title: `上流がサーバエラー (HTTP ${up.status})`, ok: false,
@@ -832,7 +932,7 @@ function judgeUpstream(up, ip, relayIp) {
     return { level: "warn", icon: "⚠️", title: `HTTP ${up.status} が返りました`, ok: false,
       detail: "403/401 ではないため IP ブロックではありません。プロキシ経由の通常利用には影響しない可能性が高いです。" };
   }
-  const route = RELAY ? `リレー (${RELAY.label}) の日本IP (${ipText})` : `Render の発信IP (${ipText})`;
+  const route = HAS_JP_EGRESS ? `${egressLabel()} の日本IP (${ipText})` : `Render の発信IP (${ipText})`;
   return { level: "ok", icon: "✅", title: `上流に受け入れられています (HTTP ${up.status}) — プロキシ利用可能`, ok: true,
     detail: `${route} からのアクセスを koetomo.fun が正常に受け入れました。このプロキシ経由で声ともを利用できます。` };
 }
@@ -846,9 +946,13 @@ async function statusPage(req, res) {
     generatedAt: new Date().toISOString(),
     proxy: { origin, upstream: UP_ORIGIN },
     relay: RELAY ? { enabled: true, url: RELAY.label, egressIp: relayIp } : { enabled: false },
+    tunnel: TUNNEL
+      ? { enabled: true, mode: "reverse-tunnel", hubPath: TUNNEL.path, ...hub.stats(), egressIp: relayIp }
+      : { enabled: false },
+    route: egressLabel(),
     upstreamProbe: up,
     egressIp: ip,
-    verdict: { ok: verdict.ok, title: verdict.title, detail: verdict.detail },
+    verdict: { ok: verdict.ok, icon: verdict.icon, level: verdict.level, title: verdict.title, detail: verdict.detail },
   };
 
   const url = new URL(req.url, origin);
@@ -870,7 +974,7 @@ async function statusPage(req, res) {
   <h2>上流チェック</h2>
   <table>
     <tr><th>対象</th><td>${escHtml(UP_ORIGIN)}/</td></tr>
-    <tr><th>経路</th><td>${RELAY ? `🇯🇵 リレー経由: <b>${escHtml(RELAY.label)}</b>` : "直接接続(リレー未設定)"}</td></tr>
+    <tr><th>経路</th><td>${HAS_JP_EGRESS ? `🇯🇵 ${escHtml(egressLabel())}` : "直接接続(日本出口なし=必ず403)"}</td></tr>
     <tr><th>HTTP ステータス</th><td>${up.ok ? up.status : "— (接続失敗)"}</td></tr>
     <tr><th>Server ヘッダ</th><td>${escHtml(up.server || "—")}</td></tr>
     <tr><th>応答時間</th><td>${up.ms} ms</td></tr>
@@ -880,16 +984,27 @@ async function statusPage(req, res) {
   <h2>発信IP (egress)</h2>
   <table>
     <tr><th>Render 自身のIP</th><td>${escHtml(ip?.ip || "—")}${ip?.country ? " / " + escHtml(countryJa) : ""}${ip?.asn || ip?.org ? " / " + escHtml([ip?.asn, ip?.org].filter(Boolean).join(" ")) : ""}</td></tr>
-    ${RELAY ? `<tr><th>リレーの出口IP<br><span class="muted">(声ともに見えるIP)</span></th><td>${escHtml(relayIp?.ip || "— (リレー経由のIP情報取得に失敗)")}${relayIp?.country ? " / " + escHtml(relayCountryJa) : ""}${relayIp?.asn || relayIp?.org ? " / " + escHtml([relayIp?.asn, relayIp?.org].filter(Boolean).join(" ")) : ""}</td></tr>` : ""}
+    ${HAS_JP_EGRESS ? `<tr><th>日本出口のIP<br><span class="muted">(声ともに見えるIP)</span></th><td>${escHtml(relayIp?.ip || "— (出口IPの取得に失敗)")}${relayIp?.country ? " / " + escHtml(relayCountryJa) : ""}${relayIp?.asn || relayIp?.org ? " / " + escHtml([relayIp?.asn, relayIp?.org].filter(Boolean).join(" ")) : ""}</td></tr>` : ""}
   </table>
+
+  ${TUNNEL ? `<h2>🇯🇵 リバーストンネル(日本のマシン)の状態</h2>
+  <table>
+    <tr><th>ハブ</th><td>${hub.enabled ? `稼働中 (端点 <code>${escHtml(hub.path)}</code>)` : "停止中 (TUNNEL_TOKEN 未設定)"}</td></tr>
+    <tr><th>接続中の日本マシン</th><td>${hub.stats().relays.length
+      ? hub.stats().relays.map((r) => `<b>${escHtml(r.name)}</b> (${escHtml(r.ip)} / 稼働 ${r.uptimeSec}秒 / 待機ソケット ${r.readySockets}本)`).join("<br>")
+      : `<span class="muted">0台 — 日本のマシンで <code>relay/reverse-tunnel.js</code> が起動していません</span>`}</td></tr>
+    <tr><th>すぐ使える待機ソケット</th><td>${hub.stats().readySockets} 本</td></tr>
+    <tr><th>確立中のトンネル</th><td>${hub.stats().activeTunnels} 本</td></tr>
+    <tr><th>待ち行列</th><td>${hub.stats().waitingRequests} 件</td></tr>
+  </table>` : ""}
 
   <h2>次のアクション</h2>
   <ul>
     ${verdict.ok
       ? `<li>✅ そのまま <a href="/"><b>プロキシ経由で声ともを開く →</b></a></li>`
-      : RELAY
-        ? `<li>❌ リレーの出口IPが日本になっているか上の表で確認し、違えば RELAY_URL の設定を見直してください。日本なのに 403 の場合はリレーの再起動(IP変更)や別プロバイダの日本サーバへの切替を検討してください。</li>`
-        : `<li>❌ 声ともは<b>日本国外のIPを一律拒否</b>しており、Render(日本リージョン無し)からの直接接続は通りません。<b>relay/README.md</b> の手順で日本の出口リレー(Oracle Cloud 無料枠など)を立て、Render の環境変数に <code>RELAY_URL</code> を設定してください。</li>`}
+      : HAS_JP_EGRESS
+        ? `<li>❌ 上の「日本出口のIP」が <b>日本 (JP)</b> になっているか確認してください。なっていなければ <code>TUNNEL_TOKEN</code>(または <code>RELAY_URL</code>)の設定ミスか、日本のマシンが接続できていません。日本なのに 403 なら、その回線のIPレンジがブロックされている可能性があるので別の回線/マシンに切り替えてください。</li>`
+        : `<li>❌ 声ともは<b>日本国外のIPを一律拒否</b>しており、Render(日本リージョン無し)からの直接接続は通りません。<b>relay/README.md</b> の「方法A: リバーストンネル(クレカ不要・ポート開放不要)」で日本のマシン(自宅PC / Raspberry Pi など)を出口にしてください。</li>`}
     <li>生データ: <a href="/__status?format=json">/__status?format=json</a></li>
   </ul>
 
@@ -909,6 +1024,13 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, [["content-type", "text/plain"]]);
     return res.end("ok");
   }
+  if (u === "/__hub") {
+    // リバーストンネルのハブ状態(日本のマシンの接続台数など)
+    const st = hub ? hub.stats() : { enabled: false, reason: "TUNNEL_TOKEN 未設定" };
+    const j = JSON.stringify(st, null, 2);
+    res.writeHead(200, [["content-type", "application/json; charset=utf-8"], ["content-length", String(Buffer.byteLength(j))], ["cache-control", "no-store"]]);
+    return res.end(j);
+  }
   if (u === "/__status") {
     return statusPage(req, res).catch((err) => {
       log("status page error:", err.message);
@@ -925,6 +1047,10 @@ const server = http.createServer((req, res) => {
 
 // WebSocket アップグレード
 server.on("upgrade", (req, socket, head) => {
+  // /__tunnel はリバーストンネルのハブ(日本のマシン + プロキシ自身の待ち合わせ用)
+  if (TUNNEL && req.url.split("?")[0] === TUNNEL.path) {
+    return hub.upgrade(req, socket, head);
+  }
   wss.handleUpgrade(req, socket, head, (client) => {
     try { relayWebSocket(req, client); }
     catch (err) { log("ws relay error:", err.message); try { client.terminate(); } catch {} }
@@ -938,7 +1064,8 @@ server.requestTimeout = 0;
 server.keepAliveTimeout = 65_000;
 
 server.listen(PORT, () => {
-  log(`listening on :${PORT}  ->  upstream ${UP_ORIGIN}  route: ${RELAY ? "relay " + RELAY.label : "direct"}`);
+  log(`listening on :${PORT}  ->  upstream ${UP_ORIGIN}  route: ${RELAY ? "relay " + RELAY.label : TUNNEL ? "reverse-tunnel (hub " + TUNNEL.path + ")" : "direct"}`);
+  if (TUNNEL) log(`ハブ稼働中: 日本のマシンは wss://<このドメイン>${TUNNEL.path} へ接続 (TUNNEL_TOKEN 必須) — 接続 0台だと上流には行けません`);
 });
 
 // Render のデプロイ切替時のグレースフルシャットダウン

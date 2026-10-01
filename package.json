@@ -9,7 +9,10 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.js && node test/chain-smoke.js"
+    "test": "node test/smoke.js && node test/chain-smoke.js && node test/tunnel-smoke.js",
+    "test:tls": "node test/tunnel-tls-smoke.js",
+    "test:live": "node test/live-tunnel-check.js",
+    "hub": "node tunnel/hub.js"
   },
   "dependencies": {
     "undici": "^6.28.1",

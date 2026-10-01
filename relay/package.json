@@ -1,0 +1,15 @@
+{
+  "name": "koetomo-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "声とも 日本出口リレー(リバーストンネル版) — 日本のマシンで node reverse-tunnel.js を実行するだけ",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node reverse-tunnel.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

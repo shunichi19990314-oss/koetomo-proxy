@@ -10,7 +10,11 @@ const { WebSocketServer } = require("ws");
 
 const BIND_ADDR = process.env.BIND_ADDR || "127.0.0.3";
 const PORT = Number(process.env.GEO_PORT || 9999);
-const JP_IPS = new Set((process.env.JP_IPS || "127.0.0.2").split(","));
+// リクエストごとに環境変数を読み直す(テスト中に「日本のIP」を切り替えられるようにするため)
+function jpIps() {
+  return new Set(String(process.env.JP_IPS || "127.0.0.2").split(",").map((x) => x.trim()).filter(Boolean));
+}
+const JP_IPS = jpIps(); // 起動時表示用
 const SELF = `http://${BIND_ADDR}:${PORT}`;
 
 function buildHtml() {
@@ -38,7 +42,7 @@ function startGeo() {
   const server = http.createServer((req, res) => {
     const peer = req.socket.remoteAddress;
     // 日本IP以外は問答無用で 403(本物の koetomo.fun の挙動を模擬)
-    if (!JP_IPS.has(peer)) return forbidden(res);
+    if (!jpIps().has(peer)) return forbidden(res);
 
     const path = req.url.split("?")[0];
     if (path === "/") {
@@ -63,7 +67,7 @@ function startGeo() {
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", (req, socket, head) => {
     const peer = socket.remoteAddress;
-    if (!JP_IPS.has(peer)) {
+    if (!jpIps().has(peer)) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       return socket.destroy();
     }
@@ -80,6 +84,6 @@ function startGeo() {
   });
 }
 
-module.exports = { startGeo, SELF, PORT, BIND_ADDR, JP_IPS };
+module.exports = { startGeo, SELF, PORT, BIND_ADDR, JP_IPS, jpIps };
 
 if (require.main === module) startGeo();

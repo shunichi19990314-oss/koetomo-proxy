@@ -1,169 +1,206 @@
-# 日本出口リレー セットアップガイド
+# 日本出口の作り方 — 「声とも」を Render 経由で開くための最後の1ピース
 
-声とも (koetomo.fun) は **日本国外のIPを一律 403 で拒否** する地域制限を運用しており、
-Render には日本リージョンが無いため、Render 単体では絶対に開けません(実測: 日本ノードのみ200、他19カ国は全て403)。
+声とも (koetomo.fun) は **日本国外のIPを一律 403 で拒否** する地域制限を運用しています
+(実測: 日本ノードのみ 200、他19カ国は全て 403)。そして **Render には日本リージョンが存在しません**。
 
-そこで、**日本にある無料サーバに小さな中継(リレー)を1つ立て**、Render プロキシの上流接続だけを日本経由にします。
+つまり **Render 側で何を設定しても、日本の出口を1つ用意するまでは絶対に開けません。**
+このフォルダはその「日本の出口」を作るためのものです。方式は2つあります。
+
+| | 方式A: リバーストンネル(**おすすめ**) | 方式B:  forward リレー |
+|---|---|---|
+| クレジットカード | **不要** | 必要(Oracle は本人確認のみ・$0) |
+| クラウド契約 | **不要**(手持ちの日本のマシンでOK) | 必要(Oracle Cloud 等) |
+| ポート開放 / グローバルIP | **不要**(CGNAT でも可) | 必要(TCP 8443 開放) |
+| 動かすもの | `relay/reverse-tunnel.js` を日本のマシンで常駐 | `relay/relay.js` を日本のサーバで常駐 |
+| Render 側の設定 | `TUNNEL_TOKEN` 1つ | `RELAY_URL` + `RELAY_CA_B64` |
+| 向いている人 | 日本で常時起動できるマシンがある | 日本の VPS を借りられる |
+| 詳細 | ↓ このページの「方式A」 | ↓ 「方式B」 |
+
+どちらでも **ブラウザで開く URL は Render のまま**(`https://koetomo.onrender.com`)。
+日本のマシン/サーバは **暗号化されたバイト列を中継するだけ** で、TLS は
+Render ⇔ koetomo.fun のエンドツーエンドのまま保たれます(中身を見られません)。
 
 ```
 あなたのブラウザ
-   │  https://koetomo.onrender.com (見た目のURLは Render のまま)
+   │  https://koetomo.onrender.com      ← 見た目のURLは Render のまま
    ▼
-Render プロキシ (Singapore 等)          … URL書き換え・Cookie・WS中継を担当(既存のまま)
-   │  RELAY_URL (Basic認証 + TLS + CONNECT トンネル)
-   ▼
-koetomo-relay (日本のサーバ・無料)     … relay/relay.js を動かすだけ(依存ゼロ)
-   │  日本IPからの接続 ✅
-   ▼
-koetomo.fun (声とも)
+Render プロキシ (Singapore 等)           … URL書き換え・Cookie・WebSocket中継
+   │
+   ├── 方式A: /__tunnel (ハブ) ←外向きWS── 日本のマシン (reverse-tunnel.js) ─┐
+   └── 方式B: RELAY_URL ─────────────────→ 日本のサーバ (relay.js) ─────────┤
+                                                                            ▼
+                                                                     koetomo.fun(声とも)
 ```
-
-リレーは **中身を見ない単なるトンネル**(CONNECT 転送)なので、TLS は Render⇔声とも でエンドツーエンドのまま保たれます。
 
 ---
 
-## 手順1: Oracle Cloud Always Free のアカウント作成
+# 方式A: リバーストンネル(クレカ不要・ポート開放不要)
 
-1. https://signup.cloud.oracle.com からアカウント作成(メール・電話番号確認あり)
-2. クレジットカードの登録が必要(**本人確認用。Always Free リソースは $0 で、勝手に課金されることはありません**)
-3. 「Pay As You Go」へのアップグレードを求められた場合も、Always Free 対象シェイプを選ぶ限り無料枠のままです
+## 仕組み(なぜポート開放が要らないのか)
 
-## 手順2: 日本リージョンでインスタンス作成
+日本の家庭回線は **グローバルIPが無い(CGNAT)** ことが多く、ルータのポート開放もできません。
+そこで **接続の向きを逆にします**。日本のマシンから Render へ「外向き」の WebSocket を
+張りっぱなしにし、Render 側は「その穴」を通じて日本から接続させます。
 
-ダッシュボード → **Compute → Instances → Create instance**:
-
-| 項目 | 値 |
-|---|---|
-| Name | `koetomo-relay` |
-| Placement | Home Region が **Japan East (Tokyo)** または **Japan Central (Osaka)** になっていることを確認 |
-| Image | **Ubuntu 22.04 / 24.04 (aarch64 または x86)** |
-| Shape | **VM.Standard.A1.Flex**(ARM・Always Free: OCPU 1〜4 / RAM 6〜24GB まで無料)<br>または **VM.Standard.E2.1.Micro**(AMD・Always Free) |
-| VCN | 既定のままでOK。**パブリックIPの割り当てあり** を確認 |
-| SSHキー | 「Generate a key pair」→ **秘密鍵・公開鍵を両方ダウンロード**(秘密鍵は紛失すると入れません) |
-
-> ⚠️ A1 Flex(ARM)は東京リージョンだと **「Out of host capacity」で creation に失敗しがち** です。
-> その場合は (a) 数時間〜数日おきに再試行、(b) E2.1.Micro(AMD)を選ぶ、(c) 「Upgrade to Pay As You Go」後に A1 を作成(Always Free 枠内は $0 のまま)のいずれか。
-
-## 手順3: VCN セキュリティリストでポート開放(重要・忘れがち)
-
-Oracle はインスタンス内の iptables とは別に、**クラウド側のファイアウォール(VCN)**でも通信を止めます。
-
-1. 作成したインスタンスのページ → **Primary VNIC → Subnet** リンク
-2. サブネットのページの **Security Lists**(既定: `Default Security List for ...`)を開く
-3. **Add Ingress Rules**:
-   - Stateless: **オフ**(チェックしない)
-   - Source CIDR: `0.0.0.0/0`
-   - IP Protocol: **TCP**
-   - Destination Port Range: **8443**(スクリプトの既定値。変えた場合はその値)
-4. Add Ingress Rules で保存
-
-## 手順4: サーバに接続してセットアップスクリプトを実行
-
-**方法A: PCからSSH**
-
-```bash
-# ダウンロードした秘密鍵を使用。ユーザー名は Ubuntu イメージでは ubuntu
-ssh -i ~/Downloads/ssh-key-*.key ubuntu@<インスタンスのパブリックIP>
+```
+[日本のマシン]  ──外向き WSS(常時・自動再接続)──▶  [Render のハブ /__tunnel]
+                                                          ▲
+[Render のプロキシ] ──「koetomo.fun:443 に繋いで」────────┘
+                                                          │ ハブが2本をペアリング
+[日本のマシン] ──実際に日本の回線から koetomo.fun へ dial ─┘
 ```
 
-**方法B: ブラウザ完結(Oracle Cloud Shell)— PCに何も入れたくない場合**
+- 日本のマシンは **受信を一切しません**(送信用の接続だけ)= ポート開放・グローバルIP不要
+- ハブは TCP バイトを素通しするだけ = **TLS はエンドツーエンド**(ハブも日本のマシンも復号できません)
+- Render 側は **`TUNNEL_TOKEN` を1つ設定するだけ**(ハブは server.js に内蔵済み)
 
-1. Oracle Cloud コンソール右上の **クラウド・シェル( >_ アイコン )** を開く(ブラウザ内ターミナル、認証済み)
-2. コンソールの「SSHキーのダウンロード」で保存した**秘密鍵をクラウド・シェルにアップロード**(ドラッグ&ドロップ)してから:
+## 手順1: トークンを作る
+
+適当な32文字程度のランダム文字列を作ります(どちらか):
 
 ```bash
-chmod 600 ssh-key-*.key
-ssh -i ssh-key-*.key ubuntu@<インスタンスのパブリックIP>
+node -e 'console.log(require("crypto").randomBytes(18).toString("base64url"))'
+openssl rand -hex 16
 ```
 
-**どちらの方法でも、サーバに入ったら:**
+## 手順2: Render に `TUNNEL_TOKEN` を設定
+
+1. Render ダッシュボード → 自分のサービス(koetomo-proxy)→ **Environment**
+2. **Add Environment Variable**
+   - Key: `TUNNEL_TOKEN`
+   - Value: 手順1で作った文字列
+3. **Save Changes** → 自動で再デプロイされます(1〜2分)
+
+> `RELAY_ALLOW` は `render.yaml` で `koetomo.fun,ipinfo.io,ipwho.is,api.ipify.org` に
+> 設定済みです。ハブはここに無いホストへの接続を拒否するので、踏み台にはなりません。
+
+## 手順3: 日本のマシンでリレーを起動
+
+**日本で常時起動しておけるマシン**なら何でも構いません(自宅PC / 実家のPC / Raspberry Pi / 常時ONのミニPC など)。
+OS は Ubuntu / Debian などの Linux が一番簡単です(macOS も可、Windows は WSL2 推奨)。
 
 ```bash
+# 1) リポジトリを取得(どこでもOK。relay/ フォルダだけあれば動きます)
 git clone https://github.com/shunichi19990314/koetomo-proxy.git
 cd koetomo-proxy/relay
-bash setup-oracle.sh
+
+# 2) 一発セットアップ(Node導入 → 設定保存 → systemd 常駐 → 状態表示まで自動)
+bash setup-reverse-tunnel.sh wss://koetomo.onrender.com/__tunnel <手順1のトークン>
 ```
 
-スクリプトが Node 20 のインストール、トークン・自己署名証明書(IP SAN付き)の生成、
-systemd 常駐化、OSファイアウォール開放まで全自动で行い、最後に:
+※ URL は **あなたの Render の URL** に置き換えてください(末尾に `/__tunnel` を付ける)。
 
-```
-RELAY_URL=https://koetomo-relay:<トークン>@<パブリックIP>:8443
-RELAY_CA_B64=<証明書のbase64 1行>
-```
-
-の **2行を表示します。これが Render に貼る値** です。
-
-動作確認(サーバ上で):
+手動で動かす場合はこれだけです:
 
 ```bash
-curl -sk https://127.0.0.1:8443/healthz      # → ok
-# PC 側から(VCN が開いていれば):
-curl -sk https://<パブリックIP>:8443/healthz  # → ok
+HUB_URL=wss://koetomo.onrender.com/__tunnel \
+TUNNEL_TOKEN=<手順1のトークン> \
+node relay/reverse-tunnel.js
 ```
 
-## 手順5: Render に環境変数を設定
+ログに次が出れば接続成功です:
 
-1. Render ダッシュボード → あなたの `koetomo` サービス → **Environment**
-2. **Add Environment Variable** で 2 つ追加:
-   - `RELAY_URL` = スクリプトが表示した1行目(トークン込み)
-   - `RELAY_CA_B64` = 2行目(長い base64。1行のまま貼り付け)
-3. **Save Changes** → 自動で再デプロイ
-4. デプロイ完了後、**`https://koetomo.onrender.com/__status`** を開く
-   - 経路が「🇯🇵 リレー経由」になり、判定が **✅ 上流に受け入れられています** になれば成功
-   - そのまま `/` を開けば声ともが動きます
+```
+[koetomo-relay] ✅ オンライン登録完了 (id=r1) — 待機ソケット 4 本を用意します
+```
+
+> **Node のバージョン**: Node 22 以上なら依存パッケージゼロで動きます。
+> Node 20 / 21 の場合は `ws` が必要なので `cd relay && npm install` を実行してください
+> (setup スクリプトが自動で判断して入れます)。
+
+## 手順4: 確認する
+
+1. `https://<あなたのRender>/__hub` を開く
+   → `"relays": [ { "name": "...", "readySockets": 4 } ]` と出ていれば日本のマシンが接続済み
+2. `https://<あなたのRender>/__status` を開く
+   → ✅ **「上流に受け入れられています」** になれば完了
+3. `https://<あなたのRender>/` を開く → 本家の声ともが動きます
+
+## 運用メモ(方式A)
+
+| こと | 挙動 |
+|---|---|
+| 日本のマシンがスリープ/電源OFF | 声ともが開けなくなります。**スリープ無効**を推奨(ネットワーク断は自動再接続します) |
+| Render がスリープ(無料プラン15分) | リレーが数秒おきに再接続を試み、Render が起きたら自動で復帰します。最初の1アクセスは数十秒かかることがあります |
+| 同時に何人使えるか | `RELAY_POOL`(既定4)が「即座に使える待機ソケット数」。不足分はハブが最大25秒キューイングし、リレーが自動補充します。家族数人程度なら既定で足ります |
+| 回線が遅い/細い | `RELAY_POOL=2` に下げる、または音声系は帯域を食うので光回線推奨 |
+| トークンを変える | Render の `TUNNEL_TOKEN` を変更 → 日本のマシン側の `/etc/koetomo-relay/env` も同じ値にして `sudo systemctl restart koetomo-relay` |
+| ログ | `sudo journalctl -u koetomo-relay -f`(systemd)/ `tail -f ~/koetomo-relay.log`(nohup) |
+| 停止 | `sudo systemctl stop koetomo-relay` / 完全削除は setup スクリプト末尾に記載 |
+| 複数台 | 同じトークンで2台以上動かすと負荷分散されます(どちらか1台が生きていれば動きます) |
+
+### うまくいかないときの切り分け
+
+| 症状 | 原因 / 対処 |
+|---|---|
+| `/__hub` の `relays` が空 | 日本のマシンでリレーが起動していない。ログを確認(`journalctl -u koetomo-relay -n 50`) |
+| ログに `❌ TUNNEL_TOKEN が一致しません` | Render の `TUNNEL_TOKEN` と違う値。合わせて再起動 |
+| ログに `ハブ接続エラー: connect ECONNREFUSED` が続く | Render がスリープ中 or URL 間違い。**スリープ中なら `/__status` を一度開いてから 1分待って**再確認 |
+| `/__status` が「上流に到達できません」 | 日本のマシンから `koetomo.fun:443` への送信が塞がれている(社内FW等)。`curl -I https://koetomo.fun` をそのマシンで実行して確認 |
+| `/__status` が ❌ 403 のまま・出口IPが日本でない | リレーが動いているマシンが実は日本でない / VPN経由。`curl https://ipinfo.io` でそのマシンのIPの国を確認 |
+| 出口IPは日本なのに 403 | そのプロバイダのIPレンジがブロック対象。別の回線(例: スマホのテザリング)で試す |
+| 最初は動くがすぐ切れる | 日本のマシンのスリープ/省電力設定。`systemctl mask sleep.target suspend.target` 等で無効化 |
 
 ---
 
-## 仕組みとセキュリティ
+# 方式B: forward リレー(日本のクラウドサーバを使う)
 
-- `relay.js` は **依存パッケージゼロ**(Node 標準のみ)の最小フォワードプロキシ
-- **Basic認証**(48文字hexトークン)必須。無い/違う場合は 407 で拒否
-- **接続先許可リスト**: `koetomo.fun`(と診断用の ipinfo.io 等)以外は 403。オープンプロキシ化しません
-- **CONNECT 先ポートは 80/443 のみ**
-- Render⇔リレー間は **TLS**(自己署名証明書 + Render 側で CA ピン留め検証)
-- リレーは TCP を中継するだけで、声ともの TLS/通信内容は復号しません(エンドツーエンド)
-- ログには接続先ホストのみ記録(通信内容は記録しません)
+日本の VPS / クラウドを借りられる場合はこちら。外向きのポート開放(TCP 8443)ができるサーバに
+`relay/relay.js` を置き、Render の `RELAY_URL` に指定します。
 
-## 運用メモ
+- 実行: **[setup-oracle.sh](setup-oracle.sh)**(Oracle Cloud Always Free 東京/大阪 向け・$0)
+  ```bash
+  git clone https://github.com/shunichi19990314/koetomo-proxy.git
+  cd koetomo-proxy/relay && bash setup-oracle.sh
+  ```
+  スクリプトが最後に `RELAY_URL=...` と `RELAY_CA_B64=...` の2行を出力するので、
+  そのまま Render の Environment に貼り付けて Save するだけで切り替わります。
 
-| やりたいこと | コマンド(日本サーバ上) |
-|---|---|
-| 状態確認 | `sudo systemctl status koetomo-relay` |
-| ログ | `sudo journalctl -u koetomo-relay -n 100 -f` |
-| 再起動 | `sudo systemctl restart koetomo-relay` |
-| IPが変わったとき | `sudo rm /etc/koetomo-relay/cert.pem && bash setup-oracle.sh`(証明書再生成 → 新しい RELAY_CA_B64 を Render に再設定) |
-| トークン再発行 | `sudo bash -c 'openssl rand -hex 24 > /etc/koetomo-relay/token' && bash setup-oracle.sh`(新しい RELAY_URL を Render に再設定) |
+## Oracle Cloud Always Free の手順(要クレジットカード=本人確認のみ・$0)
 
-## 他の日本VPSを使う場合(ConoHa / さくら / Vultr東京 / AWS東京 等)
+1. https://signup.cloud.oracle.com でアカウント作成(メール・電話番号・カード本人確認あり)
+2. **Compute → Instances → Create instance**
 
-`relay.js` はどこでも動きます。最低限これだけ:
+   | 項目 | 値 |
+   |---|---|
+   | Placement | Home Region が **Japan East (Tokyo)** / **Japan Central (Osaka)** |
+   | Image | Ubuntu 22.04 / 24.04 (aarch64 または x86) |
+   | Shape | **VM.Standard.A1.Flex**(ARM・Always Free、OCPU 1〜4 / RAM 6〜24GB)<br>在庫が無ければ **VM.Standard.E2.1.Micro**(AMD・Always Free) |
+   | VCN | 「Create new VCN」でOK。**SSH(22)は自分のIPのみ**に絞る |
 
-```bash
-# Node 20+ が入っているサーバで
-RELAY_TOKEN=$(openssl rand -hex 24) \
-RELAY_PORT=8443 \
-node relay.js &
+3. **VCN → Security List → Ingress Rules → Add Ingress Rules** で **TCP 8443**(Source `0.0.0.0/0`)を開放
+   ※ これを忘れると Render からリレーに到達できず 502 になります
+4. SSH して上記の `bash setup-oracle.sh` を実行
 
-# トークン表示 → RELAY_URL=https://koetomo-relay:<トークン>@<IP>:8443
-```
+> ARM (A1.Flex) は東京リージョンで空きが無く「Out of capacity」になることがあります。
+> その場合は AMD の E2.1.Micro を選ぶか、時間帯を変えて再試行してください。
 
-TLS を有効にするには `/etc/koetomo-relay/cert.pem` と `key.pem` を置くだけ
-(setup-oracle.sh がやっているのと同じ)。ドメイン + Let's Encrypt の正式証明書がある場合は
-`RELAY_CA_B64` 不要(通常検証が通ります)。常駐化は各環境に合わせて systemd / pm2 等で。
+## 方式B のセキュリティ
 
-## トラブルシュート
+- Basic 認証(`RELAY_TOKEN`)必須。トークン無しは 407 で拒否
+- 接続先は許可リスト(`koetomo.fun` / IP情報API のみ)。それ以外は 403
+- CONNECT 先ポートは 443 / 80 のみ = オープンプロキシ化しません
+- TLS は自己署名証明書を生成して `RELAY_CA_B64` でピン留め(盗聴・改ざん防止)
 
-| 症状 | 原因と対処 |
-|---|---|
-| `curl https://IP:8443/healthz` がタイムアウト | VCN セキュリティリスト(手順3)または iptables が閉じている |
-| Render の `/__status` が「上流に到達できません」 | RELAY_URL の打ち間違い(トークン・IP・ポート)。Render のログに `relay CONNECT failed` 等が出ます |
-| `self-signed certificate` エラー | RELAY_CA_B64 が古い/改行混入。base64 は **1行** で貼り直す。応急: `RELAY_INSECURE=true`(検証省略・非推奨) |
-| ✅になったのにサイトが重い/WSが切れる | 無料VPSの帯域・性能起因。声ともは音声系で通信量が多いので、混雑時間帯は特に影響します |
-| リレーのIP自体が403 | そのIPレンジがブロック対象。サーバ再起動でIP変更(Oracle)するか、別プロバイダの日本サーバへ |
+---
 
-## 注意
+# それでも開けないときの最終確認
 
-- 声ともは意図的に日本限定で提供されています。この構成でのアクセスが利用規約に抵触する可能性はあり、**アカウント停止リスクを含む自己責任**での利用になります
-- Oracle Always Free の利用規約(不正利用禁止・アイドルリソースの回収など)も一読を。放置アカウントは停止されることがあります
-- リレーサーバを他人に共有しないでください(トークンが漏れたら即再発行)
+`/__status` は「事実」を全部出します。ここを見れば原因は一意に決まります。
+
+| `/__status` の表示 | 意味 | 対処 |
+|---|---|---|
+| ✅ 上流に受け入れられています | 完成。`/` を開けば声ともが動きます | — |
+| ❌ HTTP 403 / 経路=直接接続 | 日本の出口がまだ無い | 上の方式A か 方式B を実施 |
+| ❌ HTTP 403 / 出口IPが日本 | そのIPレンジがブロックされている | 別の回線・別のマシンに切り替え |
+| ⚠️ 上流に到達できません | リレーが落ちている/設定ミス | 上の「切り分け」表へ |
+| `/__hub` の relays が空 | 日本のマシンが未接続 | リレーの起動とトークンを確認 |
+
+---
+
+## ⚠️ 免責
+
+声ともは運営(Meetscom 社)が **意図的に日本限定で提供** しています。
+プロキシや日本出口リレーを用いたアクセスは利用規約に反する可能性があり、
+アカウント停止などのリスクは利用者の自己責任となります。
+技術的な実現可能性と手順を記載しているものであり、利用を推奨するものではありません。

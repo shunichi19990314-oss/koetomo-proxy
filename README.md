@@ -9,39 +9,98 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 |---|---|
 | フルリバースプロキシ | GET / POST / WebSocket を koetomo.fun に転送。HTML・JS・CSS・JSON 内の絶対URL・`wss://`・URLエンコード形式・CSP ヘッダまで自分のオリジンに自動書き換え |
 | Cookie / リダイレクト対応 | `Set-Cookie` の `Domain` 剥がし、`Location` 書き換え → ログイン状態がプロキシ側ドメインで維持される設計 |
-| **🇯🇵 日本出口リレーモード** | 声ともは**日本国外IPを一律403で拒否**する地域制限あり。Render には日本リージョンが無いため、`RELAY_URL` に日本の無料サーバ(Oracle Cloud Always Free 等)を立てて上流接続だけ日本経由にする構成に対応 → **[relay/README.md](relay/README.md)** |
+| **🇯🇵 日本出口 ① リバーストンネル**(おすすめ) | 日本のマシン(自宅PC / Raspberry Pi 等)から Render へ**外向き**に接続させる方式。**クレジットカード不要・クラウド不要・ポート開放不要・グローバルIP不要(CGNAT可)**。`TUNNEL_TOKEN` を1つ設定し、日本側で `relay/reverse-tunnel.js` を起動するだけ → **[relay/README.md](relay/README.md)** |
+| **🇯🇵 日本出口 ② forward リレー** | 日本のクラウド/VPS(Oracle Always Free 東京 等)に `relay/relay.js` を置き `RELAY_URL` を指定する方式。ポート開放ができるサーバ向け → **[relay/README.md](relay/README.md)** |
+| `/__hub` | リバーストンネルのハブ状態(日本のマシンの接続台数・待機ソケット数・確立中トンネル数)を JSON で返す |
 | `/__status` 診断 | 「上流に受け入れられるIPで繋げているか」を判定(上流ステータス + Render発信IP + リレー出口IP・国・ASN + 日本語の判定文)。リレー経路も自動反映 |
 | ブロック説明ページ | 上流 403 時は謎のエラーではなく、原因(地域ブロック)と対処(リレー構築手順への誘導)を書いた日本語ページを返す。アプリ本来の 403 JSON は素通し |
 | `render.yaml` | Blueprint で **New + → Blueprint → リポジトリ選択** だけで `https://koetomo-proxy.onrender.com` が完成(Web Service からの手動作成でも同じ) |
-| 自動テスト | 直接モード33項目 + リレーチェーンモード22項目(地域ゲート模擬上流を使って「直接403→リレー経由200」まで検証) |
+| 自動テスト | 計 **101項目**: 直接モード33 + リレーチェーン22 + リバーストンネル36 + トンネル上の実HTTPS/TLS検証10(「日本国外IPは403」を模擬する上流を使い、直接403→日本出口経由200 まで検証) |
 
 ## デプロイ手順(Render)
 
 1. このフォルダを GitHub リポジトリに push する
 2. Render ダッシュボード → **New +** → **Blueprint** → そのリポジトリを選択
+   - **`TUNNEL_TOKEN` の値を聞かれます。** ランダムな32文字程度を入れてください(生成: `node -e 'console.log(require("crypto").randomBytes(18).toString("base64url"))'`)。
+     これが「日本のマシン」との合い言葉になります。**未設定だと日本出口が作れず、必ず 403 になります**
 3. 完了。`https://koetomo-proxy.onrender.com` が生まれます
-   - サービス名 `koetomo-proxy` が既に世界中の誰かに使われていた場合、Render が自動で后缀を付けた URL になります(動作は同じ)
+   - サービス名 `koetomo-proxy` が既に世界中の誰かに使われていた場合、Render が自動で接尾辞を付けた URL になります(動作は同じ)
+   - Blueprint を使わず **Web Service** から手動で作る場合は下の表のとおり
 4. **デプロイ完了 → 約2分後に [`/__status`](https://koetomo-proxy.onrender.com/__status) を開く** ← 最重要
    - ✅ ならそのまま `/` を開いて声ともを利用できます
-   - ❌ (403) なら下の「403 が出たとき」へ
+   - ❌ (403) なら下の「403 が出たとき」へ → **[relay/README.md](relay/README.md)** で日本の出口を用意
 
-> リージョンは `render.yaml` で **Singapore**(声とも=AWS東京に地理的に最寄り)に設定済みです。
-> 無料プランは 15 分無アクセスでスリープし、復帰時の初回アクセスに数十秒かかります。
+### Web Service から手動で作る場合の設定値
+
+| 項目 | 値 |
+|---|---|
+| Name | `koetomo-proxy`(→ URL になります) |
+| Region | **Singapore** |
+| Branch | `main` |
+| Runtime | Node |
+| Build Command | `npm install` |
+| Start Command | `npm start` |
+| Root Directory | (空欄) |
+| Plan | Free |
+| Advanced → Health Check Path | `/__health` |
+
+Environment Variables:
+
+| Key | Value |
+|---|---|
+| `NODE_VERSION` | `20.18.1` |
+| `UPSTREAM` | `https://koetomo.fun` |
+| `TZ` | `Asia/Tokyo` |
+| `TUNNEL_TOKEN` | 32文字程度のランダム文字列(日本のマシンと同じ値にする) |
+| `RELAY_ALLOW` | `koetomo.fun,ipinfo.io,ipwho.is,api.ipify.org` |
+
+> リージョンは **Singapore**(声とも=AWS東京に地理的に最寄り)が既定です。Render に日本リージョンは無いので、
+> 日本の出口(方式A/B)はどちらにしても必要になります。
+> 無料プランは 15 分無アクセスでスリープし、復帰時の初回アクセスに数十秒かかります
+> (リバーストンネルは日本のマシンが自動で再接続するので、手作業は不要です)。
 
 ## 開けない(403)ときは → 日本出口リレー
 
 声ともは **日本国外のIPを一律 403** にする地域制限を運用しています(実測: 日本ノードのみ 200、他19カ国は全て 403)。
 **Render には日本リージョンが無い**ため、Manual Deploy でIPを何回転がしても、リージョンを変えても、Render 単体では絶対に通りません。
 
-解決策は「日本に小さな中継(リレー)を1つ立てる」だけです。見た目のURLは Render のまま、上流への接続だけが日本出口になります。
+解決策は「日本の出口を1つ用意する」だけです。見た目のURLは Render のまま、上流への接続だけが日本出口になります。
 
 ```
-ブラウザ → Render プロキシ(既存・変更不要) → koetomo-relay(日本の無料VPS) → koetomo.fun
+ブラウザ → Render プロキシ(既存・変更不要) → 日本の出口 → koetomo.fun
 ```
 
-- 手順: **[relay/README.md](relay/README.md)**(Oracle Cloud Always Free 東京/大阪で $0、`bash relay/setup-oracle.sh` 一発)
-- Render 側に足す環境変数は 2 つだけ: `RELAY_URL` と `RELAY_CA_B64`(スクリプトが最後に出力します)
-- リレーは Basic認証 + 接続先許可リスト(koetomo.fun 等)+ CONNECT先 80/443 限定で、オープンプロキシ化しません。声ともの TLS はエンドツーエンドのまま中継されます
+### ① リバーストンネル(**おすすめ / クレジットカード不要**)
+
+日本のマシン(自宅PC・実家のPC・Raspberry Pi など)を出口にします。
+**クラウド契約もポート開放もグローバルIPも不要**(日本のマシンから Render へ外向きに繋ぐだけ)。
+
+```bash
+# 日本のマシン側(Linux 想定。Node 22+ なら依存ゼロ)
+git clone https://github.com/shunichi19990314/koetomo-proxy.git
+cd koetomo-proxy/relay
+bash setup-reverse-tunnel.sh wss://<あなたのRender>/__tunnel <TUNNEL_TOKEN>
+```
+
+- Render 側に足す環境変数は **`TUNNEL_TOKEN` の1つだけ**(ハブは server.js に内蔵)
+- 確認は `/__hub`(日本のマシンの接続状況)→ `/__status`(✅ 判定)
+- 詳細手順・切り分け表: **[relay/README.md](relay/README.md)**
+
+### ② forward リレー(日本のクラウド/VPS を使える場合)
+
+```bash
+# 日本のサーバ側
+cd koetomo-proxy/relay && bash setup-oracle.sh    # Oracle Cloud Always Free 東京/大阪($0)
+```
+
+- Render 側に足す環境変数は 2 つ: `RELAY_URL` と `RELAY_CA_B64`(スクリプトが最後に出力します)
+- 詳細: **[relay/README.md](relay/README.md)**
+
+### 共通の安全設計
+
+どちらも **Basic認証/トークン認証 + 接続先許可リスト(koetomo.fun 等)+ ポート 80/443 限定** なので、
+オープンプロキシ(踏み台)にはなりません。声ともの TLS はエンドツーエンドのまま中継されるため、
+日本のマシンもハブも通信内容を復号できません。
 
 ## /__status の読み方
 
@@ -53,13 +112,25 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 
 JSON が欲しければ `/__status?format=json`。
 
+### /__hub の読み方(リバーストンネル利用時)
+
+| 項目 | 意味 |
+|---|---|
+| `relays` | 接続中の日本のマシン(名前・IP・稼働秒数・待機ソケット数)。**空なら日本出口が無い=必ず失敗します** |
+| `readySockets` | すぐ使える待機ソケット数(リレーが事前に預けておく。要求が来ると即ペアリングされるので立ち上がり待ちが無い) |
+| `activeTunnels` / `waitingRequests` | 確立中のトンネル数 / 待機ソケットが足りずにキューされている要求数 |
+| `allow` | ハブが接続を許可するホスト(踏み台化防止の許可リスト) |
+
 ## 403 が出たとき
 
 実測の結果、声ともの 403 は **日本国外IPに対する地域ブロック** です(日本のデータセンタIPは通り、他19カ国はサーバIPでも全滅)。そのため:
 
 - ❌ **Manual Deploy(IPガチャ)・リージョン変更は無意味** — Render に日本リージョンが無い以上、直接接続は通りません
-- ✅ **正解は「日本出口リレー」** — 上の [日本出口リレー](#開けない403ときは--日本出口リレー) の手順(relay/README.md)で、日本の無料サーバに `relay/relay.js` を立てて `RELAY_URL` を設定してください
-- リレー設定後も 403 が出る場合は `/__status` の「リレーの出口IP」が日本 (JP) になっているか確認(なっていなければ RELAY_URL の指定ミス、なっていて 403 ならそのリレーのIPレンジがブロック対象 → リレー再起動でIP変更 or 別プロバイダ)
+- ✅ **正解は「日本の出口」** — クレジットカードを使いたくないなら **① リバーストンネル**(日本のマシンで `relay/reverse-tunnel.js`)、クラウドを借りられるなら **② forward リレー**(`RELAY_URL`)。手順は [relay/README.md](relay/README.md)
+- 設定後も 403 が出る場合は `/__status` の「日本出口のIP」が **日本 (JP)** になっているか確認
+  - 日本でない → `TUNNEL_TOKEN`/`RELAY_URL` の設定ミス、または日本のマシンが接続できていない(`/__hub` の `relays` が空)
+  - 日本なのに 403 → そのプロバイダのIPレンジがブロック対象。別の回線(スマホのテザリング等)や別マシンに切り替え
+- `/__hub` の `relays` が空なのに 502 になる → 日本のマシンでリレーが起動していない(またはトークン不一致で終了している)
 - 一時的な障害・メンテナンスの可能性もあるので、時間帯を変えた再確認も有効
 
 ## ローカル開発・テスト
@@ -70,10 +141,19 @@ npm start              # http://localhost:10000 → https://koetomo.fun への�
 
 # 自動テスト
 npm test
-#   ├ test/smoke.js        直接モード 33項目(URL書き換え/Cookie/WS/SSE/403/診断/オープンプロキシ防止)
-#   └ test/chain-smoke.js  リレーチェーン 22項目(「日本国外IPは403」を模擬するgeo上流 + リレー + プロキシの3段構成で
-#                          直接403→リレー経由200・書き換え・WS中継・リレー認証/許可リスト・/__status判定まで検証)
+#   ├ test/smoke.js             直接モード 33項目(URL書き換え/Cookie/WS/SSE/403/診断/オープンプロキシ防止)
+#   ├ test/chain-smoke.js       方式B リレーチェーン 22項目
+#   └ test/tunnel-smoke.js      方式A リバーストンネル 36項目(geo上流 + ハブ + 日本のマシン + プロキシのE2E。
+#                               直接403→トンネル経由200・書き換え・WS中継・8並列・トークン認証・
+#                               日本のマシン切断/復帰時の挙動・/__status・/__hub まで検証)
+
+# 実 HTTPS 上流を使った TLS 検証(ネットワーク必須)
+node test/tunnel-tls-smoke.js   # トンネル上の TLS 終端・証明書検証・ALPN まで 10項目
+node test/live-tunnel-check.js  # 実物の koetomo.fun に対して疎通確認(403 が返れば成功=地域ブロック)
 ```
+
+3段構成のテストはループバックの別アドレスで「国」を模擬します
+(`test/geo-mock-upstream.js`: `127.0.0.2` からの接続だけ 200、それ以外は `awselb/2.0` の 403)。
 
 ## 環境変数
 
@@ -86,6 +166,14 @@ npm test
 | `RELAY_URL` | (未設定=直接接続) | **日本出口リレー**のURL。`https://koetomo-relay:<トークン>@<日本のIP>:8443` 形式。設定すると上流接続とWebSocketがこのリレー経由になり、地域ブロックを回避できます |
 | `RELAY_CA_B64` | (なし) | リレーの自己署名証明書(base64・1行)。`relay/setup-oracle.sh` が出力します |
 | `RELAY_INSECURE` | (なし) | `true` でリレー証明書の検証を省略(非推奨。CAピン留めが使えない場合の応急用) |
+| **`TUNNEL_TOKEN`** | (未設定=トンネル機能オフ) | **リバーストンネルの共有シークレット**。設定すると server.js 内蔵のハブ(`/__tunnel`)が有効になり、日本のマシン(`relay/reverse-tunnel.js`)を外向き接続で受け入れられます。日本のマシン側にも同じ値を設定します |
+| `TUNNEL_MODE` | `embed` | `off` で内蔵ハブを停止(トークンは設定したまま機能を止めたい場合) |
+| `TUNNEL_PATH` | `/__tunnel` | ハブの WebSocket エンドポイント |
+| `TUNNEL_MAX` | `64` | 同時トンネル数の上限 |
+| `TUNNEL_NO_RELAY_TIMEOUT` | `25000` | 日本のマシンが1台も接続していないとき、要求を失敗させるまで待つ時間(ms)。Render のスリープ復帰→リレー再接続を待つ猶予です |
+| `RELAY_ALLOW` | `koetomo.fun,ipinfo.io,ipwho.is,api.ipify.org` | ハブ/リレーが接続を許可するホスト(踏み台化防止) |
+
+> `RELAY_URL` と `TUNNEL_TOKEN` の両方を設定した場合は **`TUNNEL_TOKEN`(リバーストンネル)が優先**されます。
 
 ## 仕組みメモ
 
@@ -94,7 +182,11 @@ npm test
 - `Origin`・`Referer` は上流ネイティブの値に補正してから転送(CSRF/Origin チェック対策)
 - 3xx は `manual` で受け、`Location` が声とも向きなら自オリジンへ書き換え、外部(OAuth 等)なら素通し
 - WebSocket は `upgrade` を捕捉し `ws` で上流へブリッジ。上流接続確立前のクライアント送信は**リスナ登録前のメッセージも取りこぼさないよう、ハンドシェイク完了直後からキュー**して開通後にまとめて転送
-- **リレーモード**: HTTP は undici `ProxyAgent`(CONNECT トンネル)、WS は自前の CONNECT トンネル確立 → `wss://` の場合は TLS ラップ → `ws` の `createConnection` に注入。声ともの TLS はエンドツーエンドで保たれ、リレーは中身を復号しません
+- **方式B リレーモード**: HTTP は undici `ProxyAgent`(CONNECT トンネル)、WS は自前の CONNECT トンネル確立 → `wss://` の場合は TLS ラップ → `ws` の `createConnection` に注入。声ともの TLS はエンドツーエンドで保たれ、リレーは中身を復号しません
+- **方式A リバーストンネル**: `tunnel/hub.js`(ハブ)が 日本のマシン(`relay/reverse-tunnel.js`)の**外向き WebSocket** を受け入れ、プロキシからの要求と配对します。日本のマシンは「すぐ使える待機ソケット」を `RELAY_POOL` 本だけ先に預けておくので、要求が来た瞬間に配对され立ち上がり待ちがありません(不足時はハブが最大 `TUNNEL_NO_RELAY_TIMEOUT` だけキューイングし、リレーが自動補充)
+  - プロキシ側は `tunnel/tunnel-bridge.js` が「ハブへの WebSocket」を **net.Socket 相当の Duplex** に見せ、HTTP は undici `Agent` の `connect` に、WS は `ws` の `createConnection` に注入します。`https`/`wss` はこの Duplex の上で `tls.connect({ socket })` するため、**証明書検証は通常どおり**行われ、ハブも日本のマシンも平文を見られません
+  - 1リクエスト=1トンネル(`pipelining: 0` + `keepAliveTimeout: 10ms` で再利用しない)ので、応答境界の判定が不要=壊れにくい設計です
+  - WS が閉じられた=日本側が上流との接続を閉じた(応答完了)と解釈し、Duplex に EOF を通知します(ここで destroy すると応答本文を捨てて 502 になるため注意)
 - SSE (`text/event-stream`) はチャンク単位で書き換えながらストリーム
 - バイナリ(画像/音声/フォント等)は無加工・ストリーム素通し。テキストは 25MB までバッファ書き換え
 - absolute-form (`GET http://example.com/`) は 400 で拒否 → オープンプロキシ化を防止
@@ -103,6 +195,8 @@ npm test
 ## 制限・注意
 
 - 対象は `koetomo.fun` / `www.koetomo.fun` のみ。他サブドメイン(`cdn.` など)が使われている場合は書き換え対象外です(現状 DNS 上 www は解決しません)
-- 声ともの地域制限(日本限定)はリレー構成で回避できますが、**リレーの日本IP自体が弾かれた場合**はリレーのIP変更/プロバイダ変更が必要です(`/__status` で切り分け可能)
+- 声ともの地域制限(日本限定)は日本出口構成で回避できますが、**日本の出口IP自体が弾かれた場合**は別の回線/マシンへの切り替えが必要です(`/__status` で切り分け可能)
+- リバーストンネルは **日本のマシンが起動している間だけ**機能します(スリープ・電源OFF・ネットワーク断で不通)。常時起動できるマシンを使い、OS のスリープは無効にしてください
+- リバーストンネルの帯域は日本のマシンの回線に依存します。音声系は帯域を食うので、光回線 + 有線LAN を推奨
 - Render 無料プラン: スリープあり(15分無アクセス→復帰に数十秒)・月 512MB アウトバウンド等の制約あり。音声系アプリは通信量が多くなりがちなので、ヘビーユースは有料プラン (`plan: starter` 等) を検討してください
 - 声ともは意図的に日本限定で提供されています。リレー/VPN等でのアクセスは利用規約に抵触し得るため、**アカウント停止リスクを含む自己責任**で判断してください。上流に過度なアクセス負荷をかけないこと
