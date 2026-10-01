@@ -20,6 +20,14 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 | `render.yaml` | Blueprint で **New + → Blueprint → リポジトリ選択** だけで `https://koetomo-proxy.onrender.com` が完成(Web Service からの手動作成でも同じ) |
 | 自動テスト | 計 **101項目**: 直接モード33 + リレーチェーン22 + リバーストンネル36 + トンネル上の実HTTPS/TLS検証10(「日本国外IPは403」を模擬する上流を使い、直接403→日本出口経由200 まで検証) |
 
+> **📌 リポジトリの移転について(2026-10-01)**
+> このリポジトリは `shunichi19990314/koetomo-proxy` から **`shunichi19990314-oss/koetomo-proxy`** に移りました(コミット履歴はそのまま引き継いでいます)。
+> そのため **既存の Render サービスは自動デプロイが止まります**。次のどちらかが必要です:
+> - Render ダッシュボード → 対象サービス → **Settings → Repository → Connect account** で `shunichi19990314-oss` を追加し、リポジトリを差し替える
+> - または **New + → Blueprint / Web Service** で新リポジトリから作り直す(設定値は下の表のとおり)
+>
+> なお旧サービス `koetomo.onrender.com` は現在 **suspended(503)** のため、**新規に作り直すほうが早い**場合があります。
+
 ## デプロイ手順(Render)
 
 1. このフォルダを GitHub リポジトリに push する
@@ -80,7 +88,7 @@ Environment Variables:
 
 ```bash
 # 日本のマシン側(Linux 想定。Node 22+ なら依存ゼロ)
-git clone https://github.com/shunichi19990314/koetomo-proxy.git
+git clone https://github.com/shunichi19990314-oss/koetomo-proxy.git
 cd koetomo-proxy/relay
 bash setup-reverse-tunnel.sh wss://<あなたのRender>/__tunnel <TUNNEL_TOKEN>
 ```

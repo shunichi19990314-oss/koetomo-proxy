@@ -187,7 +187,7 @@ if [ "$USE_SYSTEMD" = "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl
   sudo tee /etc/systemd/system/koetomo-relay.service >/dev/null <<EOF
 [Unit]
 Description=koetomo-relay (声とも 日本出口 / リバーストンネル)
-Documentation=https://github.com/shunichi19990314/koetomo-proxy
+Documentation=https://github.com/shunichi19990314-oss/koetomo-proxy
 After=network-online.target
 Wants=network-online.target
 

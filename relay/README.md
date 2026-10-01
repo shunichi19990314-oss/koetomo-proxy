@@ -86,7 +86,7 @@ OS は Ubuntu / Debian などの Linux が一番簡単です(macOS も可、Wind
 
 ```bash
 # 1) リポジトリを取得(どこでもOK。relay/ フォルダだけあれば動きます)
-git clone https://github.com/shunichi19990314/koetomo-proxy.git
+git clone https://github.com/shunichi19990314-oss/koetomo-proxy.git
 cd koetomo-proxy/relay
 
 # 2) 一発セットアップ(Node導入 → 設定保存 → systemd 常駐 → 状態表示まで自動)
@@ -155,7 +155,7 @@ node relay/reverse-tunnel.js
 
 - 実行: **[setup-oracle.sh](setup-oracle.sh)**(Oracle Cloud Always Free 東京/大阪 向け・$0)
   ```bash
-  git clone https://github.com/shunichi19990314/koetomo-proxy.git
+  git clone https://github.com/shunichi19990314-oss/koetomo-proxy.git
   cd koetomo-proxy/relay && bash setup-oracle.sh
   ```
   スクリプトが最後に `RELAY_URL=...` と `RELAY_CA_B64=...` の2行を出力するので、
