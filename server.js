@@ -1304,7 +1304,7 @@ server.keepAliveTimeout = 65_000;
 server.listen(PORT, () => {
   log(`listening on :${PORT}  ->  upstream ${UP_ORIGIN}  route: ${RELAY ? "relay " + RELAY.label : TUNNEL ? "reverse-tunnel (hub " + TUNNEL.path + ")" : "direct"}`);
   if (TUNNEL) log(`ハブ稼働中: 日本のマシンは wss://<このドメイン>${TUNNEL.path} へ接続 (TUNNEL_TOKEN 必須) — 接続 0台だと上流には行けません`);
-  if (POOL.enabled) log(`日本出口プロキシ候補 ${POOL.size} 件を実測中… 状態は /__relay で確認できます`);
+  if (POOL.enabled) log(`日本出口プロキシ候補 ${POOL.size} 件を実測中… 状態は /__relay で確認できます (deep=${process.env.RELAY_DEEP_PROBE === "1" ? "ON" : "off"}, 再実測=${Math.round((Number(process.env.RELAY_RECHECK_MS || 300000)) / 60000)}分ごと)`);
 });
 
 // Render のデプロイ切替時のグレースフルシャットダウン

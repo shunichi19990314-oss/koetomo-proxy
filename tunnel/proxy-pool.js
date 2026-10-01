@@ -28,7 +28,9 @@ const DEEP_TIMEOUT = 60_000;          // 大容量アセット検査の制限時
 // その場合ページが真っ白になります。そこで HTML から main.*.js を見つけて実際に
 // ダウンロードし、速度まで測って候補を評価します(RELAY_DEEP_PROBE=1 で有効)。
 const DEEP_PROBE = String(process.env.RELAY_DEEP_PROBE || "0") !== "0";
-const RECHECK_MS = 5 * 60_000;
+// 再実測の間隔。RELAY_DEEP_PROBE=1 のときは数MB×候補数を毎回ダウンロードするため、
+// Render 無料枠の通信量を守るには長め(例 30分)にしてください。
+const RECHECK_MS = Number(process.env.RELAY_RECHECK_MS || 5 * 60_000);
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 /** "user:pass@host:port" / "host:port" / 完全URL を候補オブジェクトにする */

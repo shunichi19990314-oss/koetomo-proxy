@@ -198,6 +198,7 @@ node test/live-tunnel-check.js  # 実物の koetomo.fun に対して疎通確認
 | `UPSTREAM_HOSTS` | `a.koetomo.fun,api.meetscom.com,mtrcs.koetomo.fun` | 一緒にプロキシする上流ホスト(声ともの API 等)。`alias=実オリジン` 形式で別の向き先にもできます(テスト用)。許可外ホストは 403 で拒否するのでオープンプロキシ化しません |
 | `UPSTREAM_HOST_FRAGMENTS` | `https://mtrcs.koetom,mtrcs.koetom` | 難読化JSで分断されたホスト名の断片。連結後に正しいURLになるよう書き換えます |
 | `RELAY_DEEP_PROBE` | `0` | `1` で候補の実測時に**アプリ本体(数MBの main.*.js)を実際にダウンロード**し、速度まで含めて評価します。「200は返るのにページが真っ白」になる遅いプロキシを自動的に外せます |
+| `RELAY_RECHECK_MS` | `300000`(5分) | 候補の再実測間隔(ms)。`RELAY_DEEP_PROBE=1` のときは通信量を守るため `1800000`(30分)程度に。いますぐ測り直すのは `/__relay?recheck=1` |
 | **`RELAY_LIST`** | (なし) | **日本出口プロキシの候補一覧**(カンマ区切り `host:port`、認証付きは `user:pass@host:port`)。起動時と5分ごとに全候補を実測して「200が返る→速い」順に並べ替え、失敗を検出したら即座に次へ回転します。死んだら自動で無効化、復帰したら自動で再利用。状態は `/__relay` |
 | `RELAY_CA_B64` | (なし) | リレーの自己署名証明書(base64・1行)。`relay/setup-oracle.sh` が出力します |
 | `RELAY_INSECURE` | (なし) | `true` でリレー証明書の検証を省略(非推奨。CAピン留めが使えない場合の応急用) |
