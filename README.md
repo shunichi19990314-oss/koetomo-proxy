@@ -96,6 +96,16 @@ cd koetomo-proxy/relay && bash setup-oracle.sh    # Oracle Cloud Always Free 東
 - Render 側に足す環境変数は 2 つ: `RELAY_URL` と `RELAY_CA_B64`(スクリプトが最後に出力します)
 - 詳細: **[relay/README.md](relay/README.md)**
 
+### ③ ブラウザだけ・クレカ不要で今すぐ試す(VPN拡張)
+
+アプリもサーバも用意せず、**ブラウザの拡張機能だけ**で日本IPを取って `koetomo.fun` を直接開く方法です
+(Render のプロキシは使いません)。手軽な反面、**音声通話(WebRTC)が通らない可能性が高い**という制約があります。
+
+- 2026年10月時点の実査で「無料・クレカ不要・日本サーバ」を満たすのは **Planet VPN lite / VeePN の拡張機能**程度
+  (Windscribe無料=日本なし、TunnelBear無料=国選択が有料化、Proton無料=日本を抽選でしか狙えない、CroxyProxy等のWebプロキシ=日本出口なし)
+- **Urban VPN は非推奨**(ユーザーデータをデータブローカーへ送信していた報告あり)
+- 詳細・手順・WebRTC漏れの確認方法: **[relay/README.md → 方法C](relay/README.md#方法c-ブラウザだけクレカ不要vpn拡張機能)**
+
 ### 共通の安全設計
 
 どちらも **Basic認証/トークン認証 + 接続先許可リスト(koetomo.fun 等)+ ポート 80/443 限定** なので、
