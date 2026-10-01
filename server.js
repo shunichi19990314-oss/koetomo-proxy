@@ -38,6 +38,71 @@ const STATUS_PROBE_TIMEOUT = 10_000;    // /__status の上流プローブ timeo
 const IPINFO_TIMEOUT = 6_000;           // /__status の発信IP情報取得 timeout (ms)
 const IPINFO_CACHE_TTL = 10 * 60_000;   // 発信IP情報のキャッシュ (ms)
 
+// ──────────────── マルチホスト対応(API など別サブドメイン) ────────────────
+// 声ともは Web 本体(koetomo.fun)以外に、API(a.koetomo.fun / api.meetscom.com)や
+// ボット検知(mtrcs.koetomo.fun)を別ホストで叩きます。これらも同じ ALB の地域ブロック対象なので、
+//   /__up/<host>/<path>  →  https://<host>/<path>
+// という形でこのプロキシ経由に書き換えます(同一オリジンになるので CORS も発生しません)。
+// WebRTC の音声メディア(sfu.skyway.ntt.com)と SkyWay 認証(skyway-auth.meetscom.com / CORS:*)は
+// 地域ブロックされていないため、ブラウザが直接接続します(プロキシ不要)。
+const UP_PREFIX = "/__up/";
+/**
+ * UPSTREAM_HOSTS の書式:  "alias[,alias=実オリジン,...]"
+ *   例) a.koetomo.fun,api.meetscom.com,api.test=http://127.0.0.3:9999
+ * 実オリジンを省略した場合は https://<alias> を指します(テスト用に http も指定可)。
+ */
+const HOST_ORIGIN = {};   // alias → 実オリジン
+const EXTRA_HOSTS = [];
+for (const spec of String(process.env.UPSTREAM_HOSTS || "a.koetomo.fun,api.meetscom.com,mtrcs.koetomo.fun").split(",")) {
+  const [a, o] = spec.split("=").map((x) => (x || "").trim());
+  if (!a) continue;
+  const alias = a.toLowerCase();
+  if (alias === UP.host || alias === UP.hostname) continue;
+  EXTRA_HOSTS.push(alias);
+  HOST_ORIGIN[alias] = o ? o.replace(/\/+$/, "") : `https://${alias}`;
+}
+/**
+ * 難読化された JS ではホスト名が文字列連結で分断されていることがあります。
+ *   例) 'https://mtrcs.koetom' + 'o.fun'
+ * この場合は完全なホスト名では一致しないので、「分断された断片」も書き換えます。
+ * 断片 → <origin>/__up/<断片のホスト部分> に置換すれば、連結後に正しいURLになります。
+ */
+const HOST_FRAGMENTS = String(process.env.UPSTREAM_HOST_FRAGMENTS || "https://mtrcs.koetom,mtrcs.koetom")
+  .split(",").map((x) => x.trim()).filter(Boolean);
+/** 許可する上流ホスト全体(長い順。書き換え・ルーティングの両方で使う) */
+const ALL_HOSTS = [...new Set([UP.host, ...EXTRA_HOSTS])].sort((a, b) => b.length - a.length);
+
+/**
+ * リクエストパスから「実際の上流」を決める。
+ *   /__up/a.koetomo.fun/users/1 → { origin:"https://a.koetomo.fun", path:"/users/1", ... }
+ *   /page                       → { origin:UP_ORIGIN,              path:"/page",     ... }
+ * 許可されていないホストは null(= 403 で拒否。オープンプロキシ化の防止)
+ */
+function resolveTarget(fullUrl) {
+  const q = fullUrl.indexOf("?");
+  const pathname = q === -1 ? fullUrl : fullUrl.slice(0, q);
+  const search = q === -1 ? "" : fullUrl.slice(q);
+  if (pathname.startsWith(UP_PREFIX)) {
+    const rest = pathname.slice(UP_PREFIX.length);
+    const i = rest.indexOf("/");
+    const host = (i === -1 ? rest : rest.slice(0, i)).toLowerCase();
+    const path = i === -1 ? "/" : rest.slice(i);
+    if (!ALL_HOSTS.includes(host)) return null;
+    const origin = HOST_ORIGIN[host] || `https://${host}`;
+    const u = new URL(origin);
+    return {
+      origin, host: u.host, hostname: u.hostname,
+      port: Number(u.port || (u.protocol === "https:" ? 443 : 80)),
+      protocol: u.protocol, wsOrigin: origin.replace(/^http/, "ws"), path, search,
+    };
+  }
+  return {
+    origin: UP_ORIGIN, host: UP.host, hostname: UP.hostname,
+    port: Number(UP.port || (UP.protocol === "https:" ? 443 : 80)),
+    protocol: UP.protocol, wsOrigin: UP_WS_ORIGIN, path: pathname, search,
+  };
+}
+
 const UA_DESKTOP =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -73,13 +138,14 @@ function publicOrigin(req) {
 //   4) //HOST  %2F%2FHOST                                      (プロトコル相対)
 //   ※ www.HOST も同一扱い。大文字小文字・16進数の大小文字を無視。
 
-function makeRewriter(srcHost, targetOrigin) {
+function makeRewriter(srcHost, targetOrigin, extraHosts = [], extraFragments = []) {
   const t = new URL(targetOrigin);
   const tHost = t.host;                             // koetomo-proxy.onrender.com / localhost:8787
   const tProto = t.protocol.replace(/:$/, "");      // https | http
   const H = escRe(srcHost);
   const WWW = `(?:www\\.)?${H}`;
   const B = String.raw`\\\/\\\/`;   // リテラルの \/\/ にマッチする正規表現ソース
+  const ESC_PREFIX = UP_PREFIX.replace(/\//g, "\\/");   // "/__up/" → "\/__up\/"(置換文字列用)
   const BR = String.raw`\/\/`;      // 置換文字列としての \/\/ (そのまま出力される)
 
   const rules = [
@@ -108,9 +174,70 @@ function makeRewriter(srcHost, targetOrigin) {
     [`%2F%2F${WWW}`, `%2F%2F${tHost}`],
   ].map(([pattern, replacement]) => [new RegExp(pattern, "gi"), replacement]);
 
+  // ── 追加ホスト(API 等)→ <origin>/__up/<host> への書き換え ──
+  // メインホストのルールより「先に」プレースホルダへ退避させる。
+  // (そうしないと a.koetomo.fun の中に koetomo.fun のルールが反応して二重写しになる)
+  const exRules = [];
+  const restore = [];
+  const tok = (name, i) => `\u0000${name}${i}\u0000`;
+  const NEG = `(?<![a-z0-9.-])`;   // 前後がホスト名の一部ではないこと(誤爆防止)
+  const NEGA = `(?![a-z0-9.-])`;
+
+  // (a) 難読化で分断されたホスト名の断片(例 'https://mtrcs.koetom' + 'o.fun')
+  (extraFragments || []).forEach((frag, i) => {
+    const m = /^(?:(wss?|https?):\/\/)?(.+)$/.exec(frag);
+    if (!m) return;
+    const sch = m[1];          // wss | ws | https | http | undefined
+    const body = m[2];
+    if (!body) return;
+    const t = tok("KF", i);
+    exRules.push([new RegExp(escRe(frag), "gi"), t]);
+    restore.push([t, `${sch ? sch + "://" : ""}${tHost}${UP_PREFIX}${body}`]);
+  });
+
+  // (b) 追加ホスト全体。ws/wss・http/https・エスケープ・エンコード・相対・素のホスト名を
+  //     それぞれ「元のスキームを保ったまま」<origin>/__up/<host> に書き換える
+  [...extraHosts].sort((a, b) => b.length - a.length).forEach((h, i) => {
+    const H = escRe(h);
+    const tWss = tok("KW", i), tWs = tok("Kw", i), tUrl = tok("KU", i), tRel = tok("KR", i), tBare = tok("KB", i);
+    const tWssE = tok("KWE", i), tWsE = tok("KwE", i), tUrlE = tok("KUE", i);   // URLエンコード形式
+    const tEsc = tok("KE", i);                                                   // \/\/ エスケープ形式
+    exRules.push(
+      [new RegExp(`wss:${B}${H}`, "gi"), tWss],
+      [new RegExp(`ws:${B}${H}`, "gi"), tWs],
+      [new RegExp(`wss://${NEG}${H}${NEGA}`, "gi"), tWss],
+      [new RegExp(`ws://${NEG}${H}${NEGA}`, "gi"), tWs],
+      [new RegExp(`https:${B}${H}`, "gi"), tEsc],
+      [new RegExp(`http:${B}${H}`, "gi"), tEsc],
+      [new RegExp(`wss%3A%2F%2F${H}`, "gi"), tWssE],
+      [new RegExp(`ws%3A%2F%2F${H}`, "gi"), tWsE],
+      [new RegExp(`https%3A%2F%2F${H}`, "gi"), tUrlE],
+      [new RegExp(`http%3A%2F%2F${H}`, "gi"), tUrlE],
+      [new RegExp(`https://${NEG}${H}${NEGA}`, "gi"), tUrl],
+      [new RegExp(`http://${NEG}${H}${NEGA}`, "gi"), tUrl],
+      [new RegExp(`//${NEG}${H}${NEGA}`, "gi"), tRel],
+      [new RegExp(`${NEG}${H}${NEGA}`, "gi"), tBare],
+    );
+    restore.push(
+      [tWss, `wss://${tHost}${UP_PREFIX}${h}`],
+      [tWs, `ws://${tHost}${UP_PREFIX}${h}`],
+      [tUrl, `${tProto}://${tHost}${UP_PREFIX}${h}`],
+      [tRel, `//${tHost}${UP_PREFIX}${h}`],
+      [tBare, `${tHost}${UP_PREFIX}${h}`],
+      // エンコード形式はエンコードのまま復元する(二重デコード事故の防止)
+      [tWssE, `wss%3A%2F%2F${tHost}%2F__up%2F${h}`],
+      [tWsE, `ws%3A%2F%2F${tHost}%2F__up%2F${h}`],
+      [tUrlE, `${tProto}%3A%2F%2F${tHost}%2F__up%2F${h}`],
+      // \/\/ エスケープ形式はエスケープを保ったまま復元する(JSON in JS 対策)
+      [tEsc, `${tProto}:${BR}${tHost}${ESC_PREFIX}${h}`],
+    );
+  });
+
   return function rewrite(text) {
     let out = String(text);
-    for (const [re, rep] of rules) out = out.replace(re, rep);
+    for (const [re, rep] of exRules) out = out.replace(re, rep);   // 追加ホストを退避
+    for (const [re, rep] of rules) out = out.replace(re, rep);      // メインホスト
+    for (const [tok, rep] of restore) out = out.split(tok).join(rep); // 復元
     return out;
   };
 }
@@ -339,16 +466,32 @@ const _downCache = new Map();  // リクエストヘッダ用: プロキシホ�
 
 /** 応答ボディ/ヘッダの書き換え(上流 → 自分) */
 function upRewriter(origin) {
-  if (!_upCache.has(origin)) _upCache.set(origin, makeRewriter(UP_HOST, origin));
+  if (!_upCache.has(origin)) _upCache.set(origin, makeRewriter(UP_HOST, origin, EXTRA_HOSTS, HOST_FRAGMENTS));
   return _upCache.get(origin);
 }
 
 /** リクエストヘッダ(referer 等)の書き換え(自分 → 上流) */
 function downRewriter(origin) {
   if (!_downCache.has(origin)) {
-    let srcHost;
-    try { srcHost = new URL(origin).host; } catch { srcHost = origin; }
-    _downCache.set(origin, makeRewriter(srcHost, UP_ORIGIN));
+    let srcHost, proto = "https";
+    try { const u = new URL(origin); srcHost = u.host; proto = u.protocol.replace(/:$/, ""); } catch { srcHost = origin; }
+    const base = makeRewriter(srcHost, UP_ORIGIN);
+    // リクエストヘッダ(referer/origin)内の <our-host>/__up/<host> を上流ネイティブの形へ戻す
+    const eS = escRe(srcHost);
+    const eP = escRe(UP_PREFIX);
+    const pairs = [...EXTRA_HOSTS].sort((a, b) => b.length - a.length).flatMap((h) => {
+      const eH = escRe(h);
+      return [
+        [new RegExp(`(?:https?|wss?)://${eS}${eP}${eH}`, "gi"), `${proto}://${h}`],
+        [new RegExp(`//${eS}${eP}${eH}`, "gi"), `//${h}`],
+        [new RegExp(`${eS}${eP}${eH}`, "gi"), h],
+      ];
+    });
+    _downCache.set(origin, function down(text) {
+      let out = String(text);
+      for (const [re, r] of pairs) out = out.replace(re, r);
+      return base(out);
+    });
   }
   return _downCache.get(origin);
 }
@@ -374,7 +517,7 @@ const URL_HEADERS = new Set([
 ]);
 
 /** ブラウザ → 上流 のリクエストヘッダを構築(Origin/Referer は上流ネイティブに見えるよう補正) */
-function buildUpstreamHeaders(req, origin) {
+function buildUpstreamHeaders(req, origin, tgt) {
   const down = downRewriter(origin);
   const h = {};
   for (const [k, v] of Object.entries(req.headers)) {
@@ -382,10 +525,26 @@ function buildUpstreamHeaders(req, origin) {
     if (REQ_DROP.has(lk) || lk.startsWith("sec-websocket")) continue;
     h[lk] = Array.isArray(v) ? v.join(", ") : v;
   }
-  // CSRF/Origin チェック対策: 上流から見た「自サイトからのリクエスト」の形に整える
+  // CSRF/Origin チェック対策: ブラウザと同じく「ページ側(Web本体)のオリジン」を送る。
+  // API が別ホスト(a.koetomo.fun 等)でも、実ブラウザは https://koetomo.fun を送ります。
+  void tgt;
   h["origin"] = UP_ORIGIN;
-  if (h["referer"]) h["referer"] = down(h["referer"]);
+  // Referer は undici が fetch の `referrer` オプションで上書きしてしまうため、
+  // ヘッダとしては削除し、呼び出し側で referrer + referrerPolicy:"unsafe-url" として渡す。
+  delete h["referer"];
   return h;
+}
+
+/**
+ * 上流へ送る Referer(= ブラウザが送るのと同じ「ページ側のオリジン」)。
+ * API が別ホストの場合でも、実際のブラウザは Web本体(koetomo.fun)の URL を送るので
+ * ここでもメインのオリジンに正規化する。
+ */
+function upstreamReferrer(req, origin, tgt) {
+  const down = downRewriter(origin);
+  const incoming = req.headers["referer"];
+  if (incoming) return down(incoming);
+  return UP_ORIGIN + "/";
 }
 
 /** 上流レスポンスの Set-Cookie をプロキシ用ドメイン向けに修正(Domain 剥がし等) */
@@ -601,7 +760,13 @@ async function proxyHttp(req, res) {
     res.writeHead(400, [["content-type", "text/plain; charset=utf-8"]]);
     return res.end("Bad request: only origin-form URLs are proxied.");
   }
-  const target = UP_ORIGIN + req.url;
+  // /__up/<host>/<path> なら別ホスト(API等)へ。それ以外は Web 本体へ
+  const tgt = resolveTarget(req.url);
+  if (!tgt) {
+    res.writeHead(403, [["content-type", "text/plain; charset=utf-8"]]);
+    return res.end("Forbidden: that upstream host is not in the allowlist (UPSTREAM_HOSTS).");
+  }
+  const target = tgt.origin + tgt.path + tgt.search;
 
   // クライアントが切れたら上流 fetch も中断
   const ac = new AbortController();
@@ -635,10 +800,14 @@ async function proxyHttp(req, res) {
   while (true) {
     try {
       upRes = await fetch(target, {
-      method: req.method,
-      headers: buildUpstreamHeaders(req, origin),
-      redirect: "manual", // 3xx は Location を書き換えてそのまま返す(外部 OAuth 等は素通し)
-      signal: ac.signal,
+        method: req.method,
+        headers: buildUpstreamHeaders(req, origin, tgt),
+        // Referer はヘッダで渡すと undici に上書きされるため、こちらで指定する。
+        // unsafe-url にしないとパス部分が削られて Origin だけになる。
+        referrer: upstreamReferrer(req, origin, tgt),
+        referrerPolicy: "unsafe-url",
+        redirect: "manual", // 3xx は Location を書き換えてそのまま返す(外部 OAuth 等は素通し)
+        signal: ac.signal,
         dispatcher: upstreamDispatcher(), // 日本出口経由(プールは自動で候補を切替)
         ...bodyOpt,
       });
@@ -757,10 +926,11 @@ function safeClose(ws, code, reason) {
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 100 * 1024 * 1024 });
 
-function relayWebSocket(req, client) {
+function relayWebSocket(req, client, tgt) {
   const origin = publicOrigin(req);
   const down = downRewriter(origin);
-  const url = UP_WS_ORIGIN + req.url;
+  const T = tgt || resolveTarget(req.url) || { wsOrigin: UP_WS_ORIGIN, path: req.url.split("?")[0], search: "", origin: UP_ORIGIN, hostname: UP.hostname, port: Number(UP.port || 443), protocol: UP.protocol };
+  const url = T.wsOrigin + T.path + (T.search || "");
 
   // 上流へ転送するハンドシェイクヘッダ(ws ライブラリが予約ヘッダは自前で設定する)
   const headers = {};
@@ -770,8 +940,8 @@ function relayWebSocket(req, client) {
     if (lk.startsWith("x-forwarded") || lk === "forwarded") continue;
     headers[lk] = Array.isArray(v) ? v.join(", ") : v;
   }
-  headers["origin"] = UP_ORIGIN;
-  if (headers["referer"]) headers["referer"] = down(headers["referer"]);
+  headers["origin"] = UP_ORIGIN;   // ブラウザ同様「ページ側のオリジン」
+  headers["referer"] = headers["referer"] ? down(headers["referer"]) : UP_ORIGIN + "/";
 
   const proto = req.headers["sec-websocket-protocol"];
   const wsOpts = {
@@ -784,17 +954,17 @@ function relayWebSocket(req, client) {
   /** 日本出口(リレー/トンネル)設定時は、その生ソケットを createConnection で ws に渡す */
   async function prepareConnection() {
     if (!RELAY && !TUNNEL) return undefined;
-    const upPort = Number(UP.port || (UP.protocol === "https:" ? 443 : 80));
+    const upPort = Number(T.port || 443);
     if (TUNNEL) {
       // リバーストンネル: TLS 込みで日本出口のソケットを作る
       const sock = await tunnelConnect({
-        hostname: UP.hostname, port: upPort, protocol: UP.protocol, servername: UP.hostname,
+        hostname: T.hostname, port: upPort, protocol: T.protocol, servername: T.hostname,
       });
       return () => sock;
     }
-    let tunnel = await relayTunnel(UP.hostname, upPort);
-    if (UP.protocol === "https:") {
-      tunnel = await tlsWrapSocket(tunnel, UP.hostname);
+    let tunnel = await relayTunnel(T.hostname, upPort);
+    if (T.protocol === "https:") {
+      tunnel = await tlsWrapSocket(tunnel, T.hostname);
     }
     return () => tunnel;
   }
@@ -830,7 +1000,7 @@ function relayWebSocket(req, client) {
     up.on("open", () => {
       upOpen = true;
       for (const [data, isBinary] of queue.splice(0)) up.send(data, { binary: isBinary });
-      log(`ws opened ${req.url} -> ${UP_WS_ORIGIN}${RELAY ? " (via relay)" : TUNNEL ? " (via tunnel)" : ""}`);
+      log(`ws opened ${req.url} -> ${T.wsOrigin}${RELAY ? " (via relay)" : TUNNEL ? " (via tunnel)" : ""}`);
     });
 
     up.on("message", (data, isBinary) => {
@@ -1036,7 +1206,7 @@ async function statusPage(req, res) {
       c.status === null ? "未測定" : /^ERR/.test(String(c.status)) ? `❌ 到達不可 (${escHtml(String(c.status).slice(0, 40))})`
       : c.status === 403 || c.status === 401 ? `❌ HTTP ${c.status}(この出口IPはブロックされています)`
       : `✅ HTTP ${c.status}`
-    }${c.ms !== null && c.ms !== undefined ? ` / ${c.ms}ms` : ""}${c.egressIp ? ` / 出口IP ${escHtml(c.egressIp)} ${escHtml(c.country || "")}` : ""}${c.disabled ? " / <b>無効化中</b>" : ""}</td></tr>`).join("")}
+    }${c.ms !== null && c.ms !== undefined ? ` / ${c.ms}ms` : ""}${c.egressIp ? ` / 出口IP ${escHtml(c.egressIp)} ${escHtml(c.country || "")}` : ""}${c.deep === "ok" ? ` / <b>アプリ本体 ${c.deepMB || 0}MB を ${c.deepSec || 0}秒 (${c.deepKBps || 0}KB/s) ✅</b>` : (c.deep && c.deep !== "no-js" ? ` / ❌ アプリ本体を落とせない(${escHtml(String(c.deep).slice(0, 30))})=ページが真っ白になります` : "")}${c.disabled ? " / <b>無効化中</b>" : ""}</td></tr>`).join("")}
   </table>
   <p class="muted">手動操作: <a href="/__relay">/__relay</a>(状態)・ <a href="/__relay?recheck=1">/__relay?recheck=1</a>(即実測)・ <a href="/__relay?rotate=1">/__relay?rotate=1</a>(強制切替)</p>` : ""}
 
@@ -1117,8 +1287,10 @@ server.on("upgrade", (req, socket, head) => {
   if (TUNNEL && req.url.split("?")[0] === TUNNEL.path) {
     return hub.upgrade(req, socket, head);
   }
+  const tgt = resolveTarget(req.url);
+  if (!tgt) { try { socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); } catch {} return; }
   wss.handleUpgrade(req, socket, head, (client) => {
-    try { relayWebSocket(req, client); }
+    try { relayWebSocket(req, client, tgt); }
     catch (err) { log("ws relay error:", err.message); try { client.terminate(); } catch {} }
   });
 });

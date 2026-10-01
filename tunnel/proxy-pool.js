@@ -23,6 +23,11 @@
 const { ProxyAgent, fetch } = require("undici");
 
 const PROBE_TIMEOUT = 9_000;
+const DEEP_TIMEOUT = 60_000;          // 大容量アセット検査の制限時間
+// 公開プロキシは「HTML(1.4KB)は取れるが 5MB のアプリ本体は落とせない」ものが多く、
+// その場合ページが真っ白になります。そこで HTML から main.*.js を見つけて実際に
+// ダウンロードし、速度まで測って候補を評価します(RELAY_DEEP_PROBE=1 で有効)。
+const DEEP_PROBE = String(process.env.RELAY_DEEP_PROBE || "0") !== "0";
 const RECHECK_MS = 5 * 60_000;
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -147,13 +152,15 @@ class RelayPool {
       const results = await Promise.all(this.list.map((c) => this.probe(c)));
       // 並べ替え: 有効(200/3xx) > 403(出口IPブロック) > エラー、同一区分内は応答時間順
       const rank = (c) => {
-        if (c.status === null) return 3;
-        if (/^ERR/.test(String(c.status))) return 4;
-        if (c.status === 403 || c.status === 401) return 2;
-        if (c.status >= 500) return 1;
+        if (c.status === null) return 4;
+        if (/^ERR/.test(String(c.status))) return 5;
+        if (c.status === 403 || c.status === 401) return 3;
+        if (c.status >= 500) return 2;
+        // 200 は返るがアプリ本体(数MBのJS)を落とせない候補は一段下げる
+        if (DEEP_PROBE && c.deep && c.deep !== "ok" && c.deep !== "no-js") return 1;
         return 0;
       };
-      this.list.sort((a, b) => (rank(a) - rank(b)) || ((a.ms ?? 1e9) - (b.ms ?? 1e9)));
+      this.list.sort((a, b) => (rank(a) - rank(b)) || ((b.deepKbps ?? 0) - (a.deepKbps ?? 0)) || ((a.ms ?? 1e9) - (b.ms ?? 1e9)));
       // 最上位をアクティブに
       const prev = this.activeIndex;
       this.activeIndex = 0;
@@ -172,6 +179,42 @@ class RelayPool {
     })();
     this.checking = run;
     try { return await run; } finally { this.checking = null; }
+  }
+
+  /**
+   * 大容量アセット(main.*.js)を実際に落とせるかを検査する。
+   * 声ともは React 製で /static/js/main.*.js が約5MBあり、これを落とせない
+   * プロキシは「200が返るのにページが真っ白」という最悪の状態になります。
+   */
+  async deepProbe(c, dispatcher) {
+    try {
+      // HTML からアプリ本体の JS を探す(ハッシュはデプロイごとに変わるので動的に取得)
+      let jsUrl = this.deepUrl;
+      if (!jsUrl) {
+        const r = await fetch(this.upstream + "/", { dispatcher, signal: AbortSignal.timeout(PROBE_TIMEOUT), headers: { "user-agent": UA, accept: "text/html" } });
+        const html = Buffer.from(await r.arrayBuffer()).toString("utf8");
+        const m = html.match(/["']([^"']*\/static\/js\/main\.[a-z0-9]+\.js)["']/i) || html.match(/src=["']([^"']+\.js)["']/i);
+        if (!m) { c.deep = "no-js"; return; }
+        jsUrl = m[1].startsWith("http") ? m[1] : this.upstream + (m[1].startsWith("/") ? m[1] : "/" + m[1]);
+        this.deepUrl = jsUrl;
+      }
+      const t0 = Date.now();
+      const r2 = await fetch(jsUrl, { dispatcher, signal: AbortSignal.timeout(DEEP_TIMEOUT), headers: { "user-agent": UA, accept: "*/*" } });
+      let n = 0;
+      const rd = r2.body.getReader();
+      for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.byteLength; }
+      const ms = Date.now() - t0;
+      c.deepBytes = n;
+      c.deepMs = ms;
+      c.deepKbps = Math.round((n / 1024) / Math.max(0.001, ms / 1000));
+      c.deep = (r2.status === 200 && n > 100_000) ? "ok" : `bad:${r2.status}/${n}B`;
+      c.deepAt = Date.now();
+      this.log(`[relay-pool] deep ${c.label}: ${c.deep} ${(n / 1048576).toFixed(2)}MB / ${(ms / 1000).toFixed(1)}秒 / ${c.deepKbps}KB/s`);
+    } catch (e) {
+      c.deep = "ERR:" + (e.cause?.code || e.message);
+      c.deepBytes = 0; c.deepKbps = 0; c.deepAt = Date.now();
+      this.log(`[relay-pool] deep ${c.label}: ${c.deep} (アプリ本体を落とせません=ページが真っ白になります)`);
+    }
   }
 
   /** 1候補を実測: 上流のステータス + 出口IP */
@@ -214,6 +257,12 @@ class RelayPool {
     c.lastCheck = Date.now();
     c.failures = /^ERR/.test(String(c.status)) ? c.failures + 1 : 0;
     if (c.failures >= 3) c.disabled = true;
+    // 大容量アセット検査(有効時のみ)。200 が返るのにアプリ本体を落とせない候補を弾く
+    if (DEEP_PROBE && !/^ERR/.test(String(c.status)) && c.status !== 403 && c.status !== 401) {
+      await this.deepProbe(c, dispatcher);
+      if (c.deep && c.deep !== "ok" && c.deep !== "no-js") c.failures += 2;
+      if (c.failures >= 3) c.disabled = true;
+    }
     return c;
   }
 
@@ -228,6 +277,8 @@ class RelayPool {
       candidates: this.list.map((c) => ({
         label: c.label, status: c.status, ms: c.ms, egressIp: c.egressIp, country: c.country,
         org: c.org, asn: c.asn, failures: c.failures, disabled: c.disabled,
+        deep: c.deep || null, deepMB: c.deepBytes ? +(c.deepBytes / 1048576).toFixed(2) : null,
+        deepSec: c.deepMs ? +(c.deepMs / 1000).toFixed(1) : null, deepKBps: c.deepKbps || null,
         lastCheck: c.lastCheck ? new Date(c.lastCheck).toISOString() : null,
         active: active === c,
       })),
