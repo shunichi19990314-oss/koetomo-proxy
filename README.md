@@ -12,6 +12,8 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 | **🇯🇵 日本出口 ① リバーストンネル**(おすすめ) | 日本のマシン(自宅PC / Raspberry Pi 等)から Render へ**外向き**に接続させる方式。**クレジットカード不要・クラウド不要・ポート開放不要・グローバルIP不要(CGNAT可)**。`TUNNEL_TOKEN` を1つ設定し、日本側で `relay/reverse-tunnel.js` を起動するだけ → **[relay/README.md](relay/README.md)** |
 | **🇯🇵 日本出口 ② forward リレー** | 日本のクラウド/VPS(Oracle Always Free 東京 等)に `relay/relay.js` を置き `RELAY_URL` を指定する方式。ポート開放ができるサーバ向け → **[relay/README.md](relay/README.md)** |
 | `/__hub` | リバーストンネルのハブ状態(日本のマシンの接続台数・待機ソケット数・確立中トンネル数)を JSON で返す |
+| `/__relay` | 日本出口プロキシ候補の実測状態(ステータス・応答時間・出口IP・国・無効化フラグ)。`?recheck=1` で即実測、`?rotate=1` で強制切替 |
+| **日本出口プロキシの自動ローテーション** | `RELAY_LIST` の候補を5分ごとに実測して並べ替え、接続エラーや ELB の 403 を検出したら**その場で次の候補に切り替えて自動リトライ**。公開プロキシのように「すぐ死ぬ」出口でも運用できます |
 | `/__status` 診断 | 「上流に受け入れられるIPで繋げているか」を判定(上流ステータス + Render発信IP + リレー出口IP・国・ASN + 日本語の判定文)。リレー経路も自動反映 |
 | ブロック説明ページ | 上流 403 時は謎のエラーではなく、原因(地域ブロック)と対処(リレー構築手順への誘導)を書いた日本語ページを返す。アプリ本来の 403 JSON は素通し |
 | `render.yaml` | Blueprint で **New + → Blueprint → リポジトリ選択** だけで `https://koetomo-proxy.onrender.com` が完成(Web Service からの手動作成でも同じ) |
@@ -96,7 +98,24 @@ cd koetomo-proxy/relay && bash setup-oracle.sh    # Oracle Cloud Always Free 東
 - Render 側に足す環境変数は 2 つ: `RELAY_URL` と `RELAY_CA_B64`(スクリプトが最後に出力します)
 - 詳細: **[relay/README.md](relay/README.md)**
 
-### ③ ブラウザだけ・クレカ不要で今すぐ試す(VPN拡張)
+### ③ 日本の無料公開プロキシ(**何もインストールしない** / 実測済み)
+
+拡張機能もアプリも使えない場合の最後の手段。**OS/ブラウザのプロキシ設定に入れるだけ**で日本IPになります。
+2026-10-01 に実測して `koetomo.fun` が **HTTP 200** になった公開プロキシと、
+Firefox / Windows / macOS / Android / iOS ごとの設定手順、注意点を
+**[relay/README.md → 方法D](relay/README.md#方法d-日本の無料公開プロキシ何もインストールしない)** にまとめています。
+
+見つけたプロキシは `RELAY_LIST` にカンマ区切りで複数入れておくと、本体が
+**5分ごとに実測して並べ替え + 失敗検出で自動ローテーション + 復帰の自動検出** を行います(`test/pool-smoke.js` で19項目検証済み)。
+状態は `/__relay`(JSON)、`/__relay?recheck=1`(即実測)、`/__relay?rotate=1`(強制切替)で確認できます。
+
+```
+RELAY_LIST = 140.238.32.108:3128,45.43.60.220:8080,38.175.202.151:443
+```
+
+死んだら `npm run scan:jp` で「日本かつ 403 以外」のプロキシを自動で探し直せます。
+
+### ④ ブラウザだけ・クレカ不要で今すぐ試す(VPN拡張)
 
 アプリもサーバも用意せず、**ブラウザの拡張機能だけ**で日本IPを取って `koetomo.fun` を直接開く方法です
 (Render のプロキシは使いません)。手軽な反面、**音声通話(WebRTC)が通らない可能性が高い**という制約があります。
@@ -105,6 +124,7 @@ cd koetomo-proxy/relay && bash setup-oracle.sh    # Oracle Cloud Always Free 東
   (Windscribe無料=日本なし、TunnelBear無料=国選択が有料化、Proton無料=日本を抽選でしか狙えない、CroxyProxy等のWebプロキシ=日本出口なし)
 - **Urban VPN は非推奨**(ユーザーデータをデータブローカーへ送信していた報告あり)
 - 詳細・手順・WebRTC漏れの確認方法: **[relay/README.md → 方法C](relay/README.md#方法c-ブラウザだけクレカ不要vpn拡張機能)**
+- ただし **拡張機能すら使えない場合は ③(公開プロキシ)が唯一の選択肢**になります
 
 ### 共通の安全設計
 
@@ -174,6 +194,7 @@ node test/live-tunnel-check.js  # 実物の koetomo.fun に対して疎通確認
 | `PUBLIC_ORIGIN` | (リクエストの Host から自動判定) | URL 書き換えに使う自分のオリジンを固定したい場合のみ設定 |
 | `TZ` | `Asia/Tokyo` | 診断ページの時刻表示用 |
 | `RELAY_URL` | (未設定=直接接続) | **日本出口リレー**のURL。`https://koetomo-relay:<トークン>@<日本のIP>:8443` 形式。設定すると上流接続とWebSocketがこのリレー経由になり、地域ブロックを回避できます |
+| **`RELAY_LIST`** | (なし) | **日本出口プロキシの候補一覧**(カンマ区切り `host:port`、認証付きは `user:pass@host:port`)。起動時と5分ごとに全候補を実測して「200が返る→速い」順に並べ替え、失敗を検出したら即座に次へ回転します。死んだら自動で無効化、復帰したら自動で再利用。状態は `/__relay` |
 | `RELAY_CA_B64` | (なし) | リレーの自己署名証明書(base64・1行)。`relay/setup-oracle.sh` が出力します |
 | `RELAY_INSECURE` | (なし) | `true` でリレー証明書の検証を省略(非推奨。CAピン留めが使えない場合の応急用) |
 | **`TUNNEL_TOKEN`** | (未設定=トンネル機能オフ) | **リバーストンネルの共有シークレット**。設定すると server.js 内蔵のハブ(`/__tunnel`)が有効になり、日本のマシン(`relay/reverse-tunnel.js`)を外向き接続で受け入れられます。日本のマシン側にも同じ値を設定します |

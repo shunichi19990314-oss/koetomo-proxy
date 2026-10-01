@@ -158,22 +158,37 @@ function parseRelayConfig() {
   return { url, token, tls: relayTlsOptions(), label: `${url.protocol}//${url.host}` };
 }
 
-const RELAY = parseRelayConfig();
+const RELAY_SINGLE = parseRelayConfig();
 
-let _relayDispatcher = null;
-/** 上流 fetch 用の dispatcher(リレー=ProxyAgent / トンネル=Agent+connect / 未設定=undefined で直接接続) */
+// ──────────────── 日本出口プロキシのプール(RELAY_LIST / RELAY_URL)────────────────
+// 公開プロキシのように「死ぬ・ブロックされる・遅い」候補を複数持たせ、
+// 実測して速くて通る順に並べ替え、失敗したら自動で次へ回転させます。
+const { RelayPool, parseCandidate } = require("./tunnel/proxy-pool");
+const POOL = new RelayPool({
+  candidates: [
+    ...(String(process.env.RELAY_LIST || "").split(",").map(parseCandidate).filter(Boolean)),
+    // RELAY_URL 単独指定も候補に含める(自己署名証明書の CA ピン留めも引き継ぐ)
+    ...(RELAY_SINGLE ? [Object.assign(parseCandidate(RELAY_SINGLE.url.toString()) || {}, { tls: RELAY_SINGLE.tls, label: RELAY_SINGLE.label })] : []),
+  ],
+  upstream: UP_ORIGIN,
+  log: (...a) => log(...a),
+});
+
+/** RELAY は「プールの現在アクティブな候補」に追随する(既存コードはそのまま動く) */
+let RELAY = null;
+function syncRelay() {
+  const c = POOL.enabled ? POOL.active() : null;
+  RELAY = c ? { url: c.url, token: c.token, tls: c.tls, label: c.label, _c: c } : null;
+  return RELAY;
+}
+syncRelay();
+
+/** 上流 fetch 用の dispatcher(プール=ProxyAgent / トンネル=Agent+connect / 未設定=undefined で直接接続) */
 function upstreamDispatcher() {
   if (TUNNEL) return tunnelDispatcher();
+  syncRelay();
   if (!RELAY) return undefined;
-  if (!_relayDispatcher) {
-    _relayDispatcher = new ProxyAgent({
-      uri: RELAY.url.toString(),
-      token: RELAY.token,
-      proxyTls: RELAY.tls,   // リレー自体への TLS(自己署名証明書など)
-      requestTls: {},        // 上流 koetomo.fun への TLS は通常検証(エンドツーエンド)
-    });
-  }
-  return _relayDispatcher;
+  return POOL.dispatcher();
 }
 
 /**
@@ -310,11 +325,12 @@ function tunnelDispatcher() {
 }
 
 /** 上流への経路が「日本出口」になっているか(リレー or トンネル) */
-const HAS_JP_EGRESS = Boolean(RELAY || TUNNEL);
+const HAS_JP_EGRESS = Boolean(POOL.enabled || TUNNEL);
 /** /__status 等に表示する経路ラベル */
 function egressLabel() {
-  if (RELAY) return "リレー経由: " + RELAY.label;
   if (TUNNEL) return "リバーストンネル経由(日本のマシン出口)";
+  syncRelay();
+  if (RELAY) return `日本出口プロキシ経由: ${RELAY.label}(候補${POOL.size}件を自動切替)`;
   return "直接接続(日本出口なし)";
 }
 
@@ -613,21 +629,46 @@ async function proxyHttp(req, res) {
     }
   }
 
-  let upRes;
-  try {
-    upRes = await fetch(target, {
+  let upRes = null;
+  let attempt = 0;
+  const MAX_RELAY_ATTEMPTS = POOL.enabled && !TUNNEL ? Math.min(4, POOL.size + 1) : 1;
+  while (true) {
+    try {
+      upRes = await fetch(target, {
       method: req.method,
       headers: buildUpstreamHeaders(req, origin),
       redirect: "manual", // 3xx は Location を書き換えてそのまま返す(外部 OAuth 等は素通し)
       signal: ac.signal,
-      dispatcher: upstreamDispatcher(), // リレー設定時は日本出口経由
-      ...bodyOpt,
-    });
-  } catch (err) {
-    if (res.headersSent || res.writableEnded) return res.destroy();
-    if (err?.name === "AbortError") return; // クライアント側切断
-    log(`upstream error ${req.method} ${req.url}:`, err?.cause?.code || err?.message, err?.cause?.message || "", err?.cause?.stack ? String(err.cause.stack).split("\n")[1] : "");
-    return sendBadGateway(req, res, origin, err);
+        dispatcher: upstreamDispatcher(), // 日本出口経由(プールは自動で候補を切替)
+        ...bodyOpt,
+      });
+
+      // ── 日本出口プロキシの自動ローテーション ──
+      // 公開プロキシは「死ぬ / 出口IPがブロックされる」のが日常なので、
+      // 接続エラーや ELB/WAF の 403 を検出したら即座に次の候補へ切り替えてやり直します。
+      if (POOL.enabled && !TUNNEL) {
+        const geoBlocked = (upRes.status === 403 || upRes.status === 401) &&
+          /awselb|cloudfront|akamaighost|nginx\/|waproxy|squid/i.test(upRes.headers.get("server") || "");
+        if (geoBlocked && attempt < MAX_RELAY_ATTEMPTS) {
+          await upRes.body?.cancel().catch(() => {});
+          const next = POOL.reportFailure(`HTTP ${upRes.status} (${upRes.headers.get("server") || "?"})`);
+          log(`upstream ${upRes.status} via ${RELAY?.label} → 日本出口を回転: 次の候補 ${next?.label || "(なし)"} [${attempt + 1}/${MAX_RELAY_ATTEMPTS}]`);
+          if (next) { attempt++; continue; }
+        }
+      }
+      break;
+    } catch (err) {
+      // プール利用時は「この候補が死んだ」だけ。次へ回転してやり直す
+      if (POOL.enabled && !TUNNEL && attempt < MAX_RELAY_ATTEMPTS) {
+        const next = POOL.reportFailure(err?.cause?.code || err?.message || "error");
+        log(`upstream error ${req.method} ${req.url} via ${RELAY?.label}: ${err?.cause?.code || err?.message} → 日本出口を回転: ${next?.label || "(なし)"} [${attempt + 1}/${MAX_RELAY_ATTEMPTS}]`);
+        if (next) { attempt++; continue; }
+      }
+      if (res.headersSent || res.writableEnded) return res.destroy();
+      if (err?.name === "AbortError") return; // クライアント側切断
+      log(`upstream error ${req.method} ${req.url}:`, err?.cause?.code || err?.message, err?.cause?.message || "", err?.cause?.stack ? String(err.cause.stack).split("\n")[1] : "");
+      return sendBadGateway(req, res, origin, err);
+    }
   }
 
   const status = upRes.status;
@@ -946,6 +987,7 @@ async function statusPage(req, res) {
     generatedAt: new Date().toISOString(),
     proxy: { origin, upstream: UP_ORIGIN },
     relay: RELAY ? { enabled: true, url: RELAY.label, egressIp: relayIp } : { enabled: false },
+    pool: POOL.stats(),
     tunnel: TUNNEL
       ? { enabled: true, mode: "reverse-tunnel", hubPath: TUNNEL.path, ...hub.stats(), egressIp: relayIp }
       : { enabled: false },
@@ -987,6 +1029,17 @@ async function statusPage(req, res) {
     ${HAS_JP_EGRESS ? `<tr><th>日本出口のIP<br><span class="muted">(声ともに見えるIP)</span></th><td>${escHtml(relayIp?.ip || "— (出口IPの取得に失敗)")}${relayIp?.country ? " / " + escHtml(relayCountryJa) : ""}${relayIp?.asn || relayIp?.org ? " / " + escHtml([relayIp?.asn, relayIp?.org].filter(Boolean).join(" ")) : ""}</td></tr>` : ""}
   </table>
 
+  ${POOL.enabled ? `<h2>🇯🇵 日本出口プロキシ候補(自動実測・自動切替)</h2>
+  <table>
+    <tr><th>候補数</th><td>${POOL.size} 件(うち有効 ${POOL.stats().candidates.filter((c) => !c.disabled).length} 件)/ 5分ごとに自動で実測し「速くて通る順」に並べ替えます</td></tr>
+    ${POOL.stats().candidates.map((c) => `<tr><th>${c.active ? "▶ " : ""}${escHtml(c.label)}</th><td>${
+      c.status === null ? "未測定" : /^ERR/.test(String(c.status)) ? `❌ 到達不可 (${escHtml(String(c.status).slice(0, 40))})`
+      : c.status === 403 || c.status === 401 ? `❌ HTTP ${c.status}(この出口IPはブロックされています)`
+      : `✅ HTTP ${c.status}`
+    }${c.ms !== null && c.ms !== undefined ? ` / ${c.ms}ms` : ""}${c.egressIp ? ` / 出口IP ${escHtml(c.egressIp)} ${escHtml(c.country || "")}` : ""}${c.disabled ? " / <b>無効化中</b>" : ""}</td></tr>`).join("")}
+  </table>
+  <p class="muted">手動操作: <a href="/__relay">/__relay</a>(状態)・ <a href="/__relay?recheck=1">/__relay?recheck=1</a>(即実測)・ <a href="/__relay?rotate=1">/__relay?rotate=1</a>(強制切替)</p>` : ""}
+
   ${TUNNEL ? `<h2>🇯🇵 リバーストンネル(日本のマシン)の状態</h2>
   <table>
     <tr><th>ハブ</th><td>${hub.enabled ? `稼働中 (端点 <code>${escHtml(hub.path)}</code>)` : "停止中 (TUNNEL_TOKEN 未設定)"}</td></tr>
@@ -1023,6 +1076,19 @@ const server = http.createServer((req, res) => {
   if (u === "/__health") {
     res.writeHead(200, [["content-type", "text/plain"]]);
     return res.end("ok");
+  }
+  if (u === "/__relay") {
+    // 日本出口プロキシ候補の実測状態。?rotate=1 で強制切替、?recheck=1 で即実測
+    const url2 = new URL(req.url, "http://localhost");
+    const send = () => {
+      const j2 = JSON.stringify({ pool: POOL.stats(), route: egressLabel(), now: new Date().toISOString() }, null, 2);
+      if (res.writableEnded) return;
+      res.writeHead(200, [["content-type", "application/json; charset=utf-8"], ["content-length", String(Buffer.byteLength(j2))], ["cache-control", "no-store"]]);
+      res.end(j2);
+    };
+    if (url2.searchParams.get("rotate") && POOL.enabled) POOL.rotate();
+    if (url2.searchParams.get("recheck")) { POOL.recheck(true).catch(() => {}).then(send); return; }
+    return send();
   }
   if (u === "/__hub") {
     // リバーストンネルのハブ状態(日本のマシンの接続台数など)
@@ -1066,6 +1132,7 @@ server.keepAliveTimeout = 65_000;
 server.listen(PORT, () => {
   log(`listening on :${PORT}  ->  upstream ${UP_ORIGIN}  route: ${RELAY ? "relay " + RELAY.label : TUNNEL ? "reverse-tunnel (hub " + TUNNEL.path + ")" : "direct"}`);
   if (TUNNEL) log(`ハブ稼働中: 日本のマシンは wss://<このドメイン>${TUNNEL.path} へ接続 (TUNNEL_TOKEN 必須) — 接続 0台だと上流には行けません`);
+  if (POOL.enabled) log(`日本出口プロキシ候補 ${POOL.size} 件を実測中… 状態は /__relay で確認できます`);
 });
 
 // Render のデプロイ切替時のグレースフルシャットダウン
