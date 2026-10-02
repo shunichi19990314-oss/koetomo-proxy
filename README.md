@@ -12,6 +12,7 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 | **🇯🇵 日本出口 ① リバーストンネル**(おすすめ) | 日本のマシン(自宅PC / Raspberry Pi 等)から Render へ**外向き**に接続させる方式。**クレジットカード不要・クラウド不要・ポート開放不要・グローバルIP不要(CGNAT可)**。`TUNNEL_TOKEN` を1つ設定し、日本側で `relay/reverse-tunnel.js` を起動するだけ → **[relay/README.md](relay/README.md)** |
 | **🇯🇵 日本出口 ② forward リレー** | 日本のクラウド/VPS(Oracle Always Free 東京 等)に `relay/relay.js` を置き `RELAY_URL` を指定する方式。ポート開放ができるサーバ向け → **[relay/README.md](relay/README.md)** |
 | `/__hub` | リバーストンネルのハブ状態(日本のマシンの接続台数・待機ソケット数・確立中トンネル数)を JSON で返す |
+| **📦 同梱アセット(vendor)** | アプリ本体 `/static/js/main.<hash>.js` は**約5MB**あり、無料の公開プロキシは HTML(1.4KB)は返せても 5MB で切れる/数分で死ぬものがほとんどです(実測)。このファイルは**名前に内容ハッシュが入っている=中身が変わればURLも変わる**ため、`vendor/koetomo/` に同梱して**プロキシを一切使わずに Render から直接配信**します(実測 **404ms**)。これで「HTML と API の JSON だけがプロキシ経由」になり、遅くて不安定な日本出口でもアプリが起動します。撮り直しは `npm run vendor` |
 | **静的アセットのキャッシュ** | 約5MBのアプリ本体 `/static/js/main.<hash>.js` は**ファイル名に内容ハッシュ**が入っているので、一度取得したらメモリに保持して2回目以降を瞬時にします(`cache-control: immutable` でブラウザ側にも強くキャッシュ)。遅い公開プロキシ経由でも**初回だけ我慢すれば以降は快適**です。状態は `/__cache`、上限は `ASSET_CACHE_MB`(既定128MB)・TTL は `ASSET_CACHE_TTL`(既定6時間)。**API や HTML は絶対にキャッシュしません**(ユーザ依存のため) |
 | `/__cache` | アセットキャッシュの状態(エントリ数・使用バイト・ヒット率・保持中のファイル一覧) |
 | `/__relay` | 日本出口プロキシ候補の実測状態(ステータス・応答時間・出口IP・国・無効化フラグ)。`?recheck=1` で即実測、`?rotate=1` で強制切替 |
@@ -209,6 +210,7 @@ node test/live-tunnel-check.js  # 実物の koetomo.fun に対して疎通確認
 | `UPSTREAM_HOST_FRAGMENTS` | `https://mtrcs.koetom,mtrcs.koetom` | 難読化JSで分断されたホスト名の断片。連結後に正しいURLになるよう書き換えます |
 | `RELAY_DEEP_PROBE` | `0` | `1` で候補の実測時に**アプリ本体(数MBの main.*.js)を実際にダウンロード**し、速度まで含めて評価します。「200は返るのにページが真っ白」になる遅いプロキシを自動的に外せます |
 | `STATUS_PROBE_TIMEOUT` | `60000` | `/__status` の上流プローブの制限時間(ms)。公開プロキシ経由は1リクエストに10秒以上かかるため、短くすると「動いているのに到達不可」と誤判定します |
+| `VENDOR_ASSETS` | `1` | `0` で同梱アセット配信を停止(常に上流へ取りに行く) |
 | `ASSET_CACHE_MB` | `128` | 静的アセットのメモリキャッシュ上限(MB)。超えたら古いものから自動で捨てます |
 | `ASSET_CACHE_TTL` | `21600000`(6時間) | アセットキャッシュの保持時間(ms) |
 | `RELAY_RECHECK_MS` | `300000`(5分) | 候補の再実測間隔(ms)。`RELAY_DEEP_PROBE=1` のときは通信量を守るため `1800000`(30分)程度に。いますぐ測り直すのは `/__relay?recheck=1` |

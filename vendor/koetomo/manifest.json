@@ -1,0 +1,38 @@
+{
+  "generatedAt": "2026-10-02T01:33:27.999Z",
+  "origin": "https://koetomo.fun",
+  "note": "tools/vendor-assets.js で生成。ファイル名に内容ハッシュが入っているので、上流が更新されたら撮り直すこと。",
+  "files": [
+    {
+      "path": "/images/favicon.ico",
+      "bytes": 4286,
+      "contentType": "image/x-icon"
+    },
+    {
+      "path": "/images/icon.svg",
+      "bytes": 20827,
+      "contentType": "image/svg+xml"
+    },
+    {
+      "path": "/images/apple-touch-icon.png",
+      "bytes": 20371,
+      "contentType": "image/png"
+    },
+    {
+      "path": "/manifest.json",
+      "bytes": 437,
+      "contentType": "application/json; charset=UTF-8"
+    },
+    {
+      "path": "/static/js/main.768aa9e3.js",
+      "bytes": 5318711,
+      "contentType": "application/javascript; charset=UTF-8"
+    },
+    {
+      "path": "/static/css/main.2f54dfd6.css",
+      "bytes": 238,
+      "contentType": "text/css; charset=UTF-8"
+    }
+  ],
+  "failed": []
+}

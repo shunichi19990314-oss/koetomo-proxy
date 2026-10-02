@@ -16,6 +16,8 @@
  */
 
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const net = require("net");
 const tls = require("tls");
 const { Readable, Transform } = require("stream");
@@ -463,6 +465,60 @@ function egressLabel() {
   return "直接接続(日本出口なし)";
 }
 
+// ──────────────── 同梱アセット(vendor/koetomo)────────────────
+// アプリ本体 /static/js/main.<hash>.js は約5MBあり、無料の公開プロキシは
+// HTML(1.4KB)は返せても 5MB で切れる/数分で死ぬものがほとんどです(実測)。
+// このファイルは**ファイル名に内容ハッシュが入っている=中身が変わればURLも変わる**ので、
+// 一度取得してリポジトリに同梱しておけば、以降はプロキシを一切使わずに Render から直接配れます。
+// 結果として「HTML(1.4KB)と API の JSON(数KB)だけがプロキシ経由」になり、
+// 遅くて不安定な日本出口でもアプリが実際に起動します。
+//
+// 撮り直し: node tools/vendor-assets.js   (上流が更新されてハッシュが変わったら実行)
+const VENDOR_DIR = path.join(__dirname, "vendor", "koetomo");
+const VENDOR_ENABLED = String(process.env.VENDOR_ASSETS || "1") !== "0";
+let VENDOR = null;                 // pathname → { abs, ct, bytes }
+let VENDOR_META = null;
+function loadVendor() {
+  if (!VENDOR_ENABLED) return;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(VENDOR_DIR, "manifest.json"), "utf8"));
+    const map = new Map();
+    for (const f of meta.files || []) {
+      const abs = path.join(VENDOR_DIR, String(f.path).replace(/^\/+/, ""));
+      if (fs.existsSync(abs)) map.set(f.path, { abs, ct: f.contentType || "application/octet-stream", bytes: f.bytes || fs.statSync(abs).size });
+    }
+    if (map.size) { VENDOR = map; VENDOR_META = meta; log(`同梱アセット ${map.size} 件をロード (${meta.generatedAt || "?"}) — プロキシを使わずに直接配信します`); }
+  } catch { VENDOR = null; }
+}
+loadVendor();
+
+const vendorCache = new Map();     // origin|path → { body, ct }(書き換え済みを一回だけ作る)
+/** 同梱アセットがあればそれで応答する(true を返したら上流には行かない) */
+function serveVendor(req, res, tgt, origin, started) {
+  if (!VENDOR || tgt.host !== UP.host) return false;
+  const ent = VENDOR.get(tgt.path);
+  if (!ent) return false;
+  const key = origin + "|" + tgt.path;
+  let c = vendorCache.get(key);
+  if (!c) {
+    const raw = fs.readFileSync(ent.abs);
+    // テキスト(js/css/html/svg/json)は URL 書き換えが必要。バイナリ(画像/フォント)はそのまま
+    const rewritable = /(javascript|json|css|html|svg|xml|text)/i.test(ent.ct || "");
+    c = { body: rewritable ? Buffer.from(upRewriter(origin)(raw.toString("utf8")), "utf8") : raw, ct: ent.ct };
+    vendorCache.set(key, c);
+  }
+  res.writeHead(200, [
+    ["content-type", c.ct],
+    ["content-length", String(c.body.length)],
+    ["cache-control", "public, max-age=31536000, immutable"],
+    ["x-proxy-cache", "VENDOR"],
+    ["x-proxied-by", "koetomo-proxy"],
+  ]);
+  log(`VENDOR ${tgt.path} (${(c.body.length / 1024).toFixed(0)}KB, ${Date.now() - started}ms)`);
+  res.end(req.method === "HEAD" ? undefined : c.body);
+  return true;
+}
+
 // ──────────────── 静的アセットのキャッシュ ────────────────
 // 声とものアプリ本体 /static/js/main.<hash>.js は約5MBあり、日本出口が公開プロキシだと
 // 取得に数秒〜数十秒かかります。ファイル名に内容ハッシュが入っている(=内容が変わればURLも変わる)
@@ -809,6 +865,9 @@ async function proxyHttp(req, res) {
     return res.end("Forbidden: that upstream host is not in the allowlist (UPSTREAM_HOSTS).");
   }
   const target = tgt.origin + tgt.path + tgt.search;
+
+  // ── 同梱アセット(vendor)があればそれで即応答(日本出口を一切使わない) ──
+  if (serveVendor(req, res, tgt, origin, started)) return;
 
   // ── 静的アセットのキャッシュ(ファイル名に内容ハッシュが入っているので安全) ──
   // 5MB のアプリ本体を遅い日本出口から毎回取りに行くと十数秒かかるため、2回目以降は瞬時にします。
@@ -1343,6 +1402,12 @@ const server = http.createServer((req, res) => {
       ageSec: Math.round((Date.now() - v.at) / 1000),
     })).sort((a, b) => b.kb - a.kb);
     const j = JSON.stringify({
+      vendor: VENDOR ? {
+        enabled: true, files: VENDOR.size, generatedAt: VENDOR_META?.generatedAt || null,
+        totalMB: +([...VENDOR.values()].reduce((a, b) => a + (b.bytes || 0), 0) / 1048576).toFixed(2),
+        paths: [...VENDOR.keys()],
+        note: "同梱アセットは日本出口プロキシを使わずに Render から直接配信されます",
+      } : { enabled: false, note: "vendor/koetomo が無い(または VENDOR_ASSETS=0)。node tools/vendor-assets.js で生成できます" },
       enabled: true, entries: assetCache.size, bytes: assetCacheBytes,
       limitMB: Math.round(ASSET_CACHE_MAX / 1048576), ttlHours: Math.round(ASSET_CACHE_TTL / 3600_000),
       hits: assetHits, misses: assetMisses,
