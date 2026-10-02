@@ -34,7 +34,9 @@ const PORT = Number(process.env.PORT || 10000);
 
 const TEXT_MAX = 25 * 1024 * 1024;      // 書き換え用にバッファする応答ボディの上限
 const REQ_BUF_MAX = 8 * 1024 * 1024;    // これ以下のリクエストボディはバッファ(content-length 正確)、超過分はストリーム転送
-const STATUS_PROBE_TIMEOUT = 10_000;    // /__status の上流プローブ timeout (ms)
+// 公開プロキシ経由は 1 リクエストに 10 秒以上かかることが普通なので、
+// タイムアウトを短くすると「実際は動いているのに到達不可」と誤判定します。
+const STATUS_PROBE_TIMEOUT = Number(process.env.STATUS_PROBE_TIMEOUT || 60_000);
 const IPINFO_TIMEOUT = 6_000;           // /__status の発信IP情報取得 timeout (ms)
 const IPINFO_CACHE_TTL = 10 * 60_000;   // 発信IP情報のキャッシュ (ms)
 
@@ -461,6 +463,46 @@ function egressLabel() {
   return "直接接続(日本出口なし)";
 }
 
+// ──────────────── 静的アセットのキャッシュ ────────────────
+// 声とものアプリ本体 /static/js/main.<hash>.js は約5MBあり、日本出口が公開プロキシだと
+// 取得に数秒〜数十秒かかります。ファイル名に内容ハッシュが入っている(=内容が変わればURLも変わる)
+// ので、一度取得したら積極的にキャッシュして 2 回目以降を瞬時にします。
+// Render のディスクは揮発性なのでメモリ上に保持し、上限を超えたら古いものから捨てます。
+const ASSET_CACHE_MAX = Number(process.env.ASSET_CACHE_MB || 128) * 1024 * 1024;
+const ASSET_CACHE_TTL = Number(process.env.ASSET_CACHE_TTL || 6 * 3600_000);   // 6時間
+const assetCache = new Map();   // key -> { body:Buffer, headers:Array, at:number, ct:string }
+let assetCacheBytes = 0;
+let assetHits = 0, assetMisses = 0;
+
+/** キャッシュしてよいパスか(内容ハッシュ付き静的アセットのみ。ユーザ依存のAPIは絶対に缓存しない) */
+function isCacheableAsset(pathname) {
+  if (!/^\/(static|assets|bundles|media|img|images|fonts)\//i.test(pathname)) return false;
+  return /\.(js|mjs|css|woff2?|ttf|otf|png|jpe?g|gif|webp|svg|ico|map|wasm|mp3|mp4)(\?|$)/i.test(pathname);
+}
+
+function assetCacheSet(key, body, headers, ct) {
+  if (body.length > ASSET_CACHE_MAX) return;              // 巨大すぎる単体は入れない
+  const prev = assetCache.get(key);
+  if (prev) { assetCacheBytes -= prev.body.length; assetCache.delete(key); }
+  assetCache.set(key, { body, headers, at: Date.now(), ct });
+  assetCacheBytes += body.length;
+  // LRU: 上限を超えたら古いものから捨てる
+  for (const [k, v] of assetCache) {
+    if (assetCacheBytes <= ASSET_CACHE_MAX) break;
+    assetCacheBytes -= v.body.length;
+    assetCache.delete(k);
+  }
+}
+
+function assetCacheGet(key) {
+  const e = assetCache.get(key);
+  if (!e) return null;
+  if (Date.now() - e.at > ASSET_CACHE_TTL) { assetCacheBytes -= e.body.length; assetCache.delete(key); return null; }
+  // 触ったものを最新に(LRU)
+  assetCache.delete(key); assetCache.set(key, e);
+  return e;
+}
+
 const _upCache = new Map();    // 応答用: 上流ホスト → プロキシオリジン
 const _downCache = new Map();  // リクエストヘッダ用: プロキシホスト → 上流オリジン
 
@@ -768,6 +810,27 @@ async function proxyHttp(req, res) {
   }
   const target = tgt.origin + tgt.path + tgt.search;
 
+  // ── 静的アセットのキャッシュ(ファイル名に内容ハッシュが入っているので安全) ──
+  // 5MB のアプリ本体を遅い日本出口から毎回取りに行くと十数秒かかるため、2回目以降は瞬時にします。
+  const cacheKey = req.method === "GET" && isCacheableAsset(tgt.path) ? (tgt.host + tgt.path) : null;
+  if (cacheKey) {
+    const hit = assetCacheGet(cacheKey);
+    if (hit) {
+      assetHits++;
+      res.writeHead(200, [
+        ...hit.headers.filter(([k]) => !/^(content-length|cache-control|transfer-encoding|x-proxy-cache)$/i.test(k)),
+        ["content-type", hit.ct],
+        ["content-length", String(hit.body.length)],
+        ["cache-control", "public, max-age=31536000, immutable"],
+        ["x-proxy-cache", "HIT"],
+        ["x-proxied-by", "koetomo-proxy"],
+      ]);
+      log(`cache HIT  ${tgt.path} (${(hit.body.length / 1024).toFixed(0)}KB, ${Date.now() - started}ms)`);
+      return res.end(req.method === "HEAD" ? undefined : hit.body);
+    }
+    assetMisses++;
+  }
+
   // クライアントが切れたら上流 fetch も中断
   const ac = new AbortController();
   res.on("close", () => ac.abort());
@@ -881,6 +944,13 @@ async function proxyHttp(req, res) {
     if (!overflow) {
       const out = Buffer.from(rewrite(Buffer.concat(chunks, size).toString("utf8")), "utf8");
       const headers = buildResponseHeaders(upRes, rewrite, origin, "rewrite");
+      // 内容ハッシュ付き静的アセットはブラウザにも強くキャッシュさせる
+      if (cacheKey && status === 200) {
+        assetCacheSet(cacheKey, out, headers, upCt || "application/octet-stream");
+        for (let i = headers.length - 1; i >= 0; i--) if (/^cache-control$/i.test(headers[i][0])) headers.splice(i, 1);
+        headers.push(["cache-control", "public, max-age=31536000, immutable"], ["x-proxy-cache", "MISS"]);
+        log(`cache STORE ${tgt.path} (${(out.length / 1024).toFixed(0)}KB)`);
+      }
       headers.push(["content-length", String(out.byteLength)]);
       res.writeHead(status, headers);
       log(`${req.method} ${req.url} -> ${status} (${Date.now() - started}ms, ${size}B rewritten)`);
@@ -1246,6 +1316,21 @@ const server = http.createServer((req, res) => {
   if (u === "/__health") {
     res.writeHead(200, [["content-type", "text/plain"]]);
     return res.end("ok");
+  }
+  if (u === "/__cache") {
+    const items = [...assetCache.entries()].map(([k, v]) => ({
+      key: k, kb: Math.round(v.body.length / 1024), ct: v.ct,
+      ageSec: Math.round((Date.now() - v.at) / 1000),
+    })).sort((a, b) => b.kb - a.kb);
+    const j = JSON.stringify({
+      enabled: true, entries: assetCache.size, bytes: assetCacheBytes,
+      limitMB: Math.round(ASSET_CACHE_MAX / 1048576), ttlHours: Math.round(ASSET_CACHE_TTL / 3600_000),
+      hits: assetHits, misses: assetMisses,
+      hitRate: assetHits + assetMisses ? Math.round((assetHits / (assetHits + assetMisses)) * 100) + "%" : "-",
+      items,
+    }, null, 2);
+    res.writeHead(200, [["content-type", "application/json; charset=utf-8"], ["content-length", String(Buffer.byteLength(j))], ["cache-control", "no-store"]]);
+    return res.end(j);
   }
   if (u === "/__relay") {
     // 日本出口プロキシ候補の実測状態。?rotate=1 で強制切替、?recheck=1 で即実測

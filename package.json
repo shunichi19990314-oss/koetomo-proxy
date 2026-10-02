@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.js && node test/chain-smoke.js && node test/tunnel-smoke.js && node test/pool-smoke.js && node test/multihost-smoke.js",
+    "test": "node test/smoke.js && node test/chain-smoke.js && node test/tunnel-smoke.js && node test/pool-smoke.js && node test/multihost-smoke.js && node test/cache-smoke.js",
     "test:tls": "node test/tunnel-tls-smoke.js",
     "test:live": "node tools/live-multihost-check.js",
     "hub": "node tunnel/hub.js",
