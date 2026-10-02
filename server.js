@@ -1396,6 +1396,132 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, [["content-type", "text/plain"]]);
     return res.end("ok");
   }
+  if (u === "/__diag") {
+    // 声ともは登録・ログインに reCAPTCHA v3(sitekey は koetomo.fun に紐付け)を必須にしています。
+    // reCAPTCHA は「実行されたドメイン」を見るため、このプロキシのドメインでは
+    // トークン生成か検証のどちらかで失敗するはずです。それをブラウザ上で実際に確認するページです。
+    const sitekey = process.env.RECAPTCHA_SITEKEY || "6Lc5EAUqAAAAALIkkvQ8JPFQaNhzv3wnUjImUZlJ";
+    const body = `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>声ともプロキシ 診断 (/__diag)</title>
+<style>
+ body{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;background:#0f1115;color:#e8eaed;margin:0;padding:24px;line-height:1.6}
+ .card{max-width:820px;margin:0 auto;background:#171a21;border:1px solid #262b36;border-radius:12px;padding:24px}
+ h1{font-size:1.3rem;margin:0 0 4px} h2{font-size:1.02rem;margin:26px 0 8px;color:#9fb0c8}
+ .muted{color:#8b93a1;font-size:.86rem}
+ table{width:100%;border-collapse:collapse;font-size:.9rem}
+ th,td{text-align:left;padding:7px 9px;border-bottom:1px solid #262b36;vertical-align:top}
+ th{color:#9fb0c8;font-weight:600;white-space:nowrap;width:190px}
+ code{background:#0f1115;padding:1px 5px;border-radius:4px;font-size:.85em;word-break:break-all}
+ .ok{color:#7ee787}.bad{color:#ff7b72}.warn{color:#ffd479}
+ .verdict{padding:14px 16px;border-radius:10px;margin:14px 0;font-weight:600}
+ .verdict.ok{background:#12261a;border:1px solid #2ea04366}
+ .verdict.bad{background:#2a1416;border:1px solid #ff7b7255}
+ .verdict.warn{background:#2a2312;border:1px solid #ffd47955}
+ #log{background:#0f1115;border:1px solid #262b36;border-radius:8px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:.78rem;white-space:pre-wrap;max-height:280px;overflow:auto;color:#9fb0c8}
+ button{background:#2ea043;border:0;color:#fff;padding:9px 16px;border-radius:8px;font-size:.9rem;cursor:pointer}
+</style></head><body><div class="card">
+<h1>🩺 声ともプロキシ 診断 — reCAPTCHA / API 到達性</h1>
+<p class="muted">「登録エラー エラーが発生しました。」の原因を、あなたのブラウザ上で実際に検査します。何も入力不要・自動で走ります。</p>
+<div id="verdict" class="verdict warn">検査中…</div>
+
+<h2>1. このページの環境</h2>
+<table>
+ <tr><th>hostname</th><td><code id="hn"></code> <span class="muted">(reCAPTCHA が見るドメイン)</span></td></tr>
+ <tr><th>声ともが登録しているドメイン</th><td><code>koetomo.fun</code></td></tr>
+ <tr><th>sitekey</th><td><code>${sitekey}</code></td></tr>
+</table>
+
+<h2>2. reCAPTCHA v3(登録・ログインに必須)</h2>
+<table>
+ <tr><th>スクリプト読込</th><td id="r-load">—</td></tr>
+ <tr><th>execute() の結果</th><td id="r-exec">—</td></tr>
+ <tr><th>トークン</th><td id="r-token">—</td></tr>
+</table>
+
+<h2>3. API(日本出口経由)の到達性</h2>
+<table>
+ <tr><th>a.koetomo.fun</th><td id="a-api">—</td></tr>
+ <tr><th>mtrcs(FingerprintJS)</th><td id="a-fp">—</td></tr>
+ <tr><th>api.meetscom.com</th><td id="a-mc">—</td></tr>
+</table>
+
+<h2>ログ</h2>
+<div id="log"></div>
+<p class="muted" style="margin-top:18px">※ このページは声とも側の reCAPTCHA sitekey を使って「このドメインでトークンが発行されるか」を確かめるだけの診断です。認証の回避や改ざんは行いません。</p>
+</div>
+<script>
+const SITEKEY=${JSON.stringify(sitekey)};
+const $=(id)=>document.getElementById(id);
+const log=(m)=>{$("log").textContent+=m+"\n";$("log").scrollTop=$("log").scrollHeight;};
+$("hn").textContent=location.hostname;
+const setV=(cls,txt)=>{const v=$("verdict");v.className="verdict "+cls;v.textContent=txt;};
+const set=(id,cls,html)=>{$(id).innerHTML='<span class="'+cls+'">'+html+"</span>";};
+
+(async()=>{
+  const res={recaptcha:false};
+  // ── reCAPTCHA v3 ──
+  log("[1] reCAPTCHA スクリプトを読み込みます…");
+  const okLoad=await new Promise((resolve)=>{
+    const sc=document.createElement("script");
+    sc.src="https://www.google.com/recaptcha/api.js?render="+SITEKEY;
+    sc.async=true;
+    const t=setTimeout(()=>{log("[1] ⏱ 15秒でタイムアウト");resolve(false);},15000);
+    sc.onload=()=>{clearTimeout(t);log("[1] ✅ スクリプト読込 OK");resolve(true);};
+    sc.onerror=()=>{clearTimeout(t);log("[1] ❌ スクリプト読込失敗");resolve(false);};
+    document.head.appendChild(sc);
+  });
+  set("r-load",okLoad?"ok":"bad",okLoad?"成功":"失敗");
+  if(okLoad){
+    log("[2] grecaptcha.execute(sitekey,{action:'signup'}) を実行します…");
+    const t0=Date.now();
+    try{
+      await new Promise((r)=>grecaptcha.ready(r));
+      const token=await grecaptcha.execute(SITEKEY,{action:"signup"});
+      const ms=Date.now()-t0;
+      if(token&&token.length>20){
+        res.recaptcha=true;
+        set("r-exec","ok","成功 ("+ms+"ms)");
+        set("r-token","ok","取得できました ("+token.length+"文字 / 先頭 "+token.slice(0,14)+"…)");
+        log("[2] ✅ トークン取得成功 "+token.length+"文字 ("+ms+"ms)");
+        log("    → ただしこのトークンは hostname="+location.hostname+" で発行されたものです。");
+        log("      声とも側(koetomo.fun 登録の sitekey)の検証を通るかは server 側次第です。");
+      }else{
+        set("r-exec","bad","トークンが空");
+        set("r-token","bad","—");
+        log("[2] ❌ トークンが空でした");
+      }
+    }catch(e){
+      set("r-exec","bad","例外: "+String(e&&e.message||e));
+      set("r-token","bad","—");
+      log("[2] ❌ execute() が失敗: "+String(e&&e.message||e));
+      log("    → sitekey にこのドメイン ("+location.hostname+") が登録されていないための典型的な症状です。");
+    }
+  }
+  // ── API 到達性(このプロキシ経由 = 日本出口)──
+  const check=async(id,path,label)=>{
+    try{
+      const t=Date.now();
+      const r=await fetch(path,{headers:{accept:"application/json"}});
+      const b=await r.text();
+      const ms=Date.now()-t;
+      const blocked=(r.status===403&&/awselb|Forbidden/i.test((r.headers.get("server")||"")+b.slice(0,120)));
+      set(id,blocked?"bad":(r.status<500?"ok":"warn"),"HTTP "+r.status+" / "+ms+"ms"+(blocked?" 🚫地域ブロック中":"")+"<br><span class='muted'>"+b.slice(0,90).replace(/[<>]/g,"")+"</span>");
+      log("[3] "+label+" → HTTP "+r.status+" ("+ms+"ms)"+(blocked?" 🚫地域ブロック":""));
+    }catch(e){ set(id,"bad","エラー: "+(e.message||e)); log("[3] "+label+" → ERR "+(e.message||e)); }
+  };
+  await check("a-api","/__up/a.koetomo.fun/recaptcha/","a.koetomo.fun /recaptcha/");
+  await check("a-fp","/__up/mtrcs.koetomo.fun/","mtrcs.koetomo.fun");
+  await check("a-mc","/__up/api.meetscom.com/","api.meetscom.com");
+
+  // ── 総合判定 ──
+  if(res.recaptcha) setV("warn","⚠️ このドメインで reCAPTCHA トークンは発行されました。登録が失敗するなら、サーバ側の検証(hostname 不一致)か別の要因です。上のログを教えてください。");
+  else setV("bad","❌ reCAPTCHA がこのドメインで通りません。声ともの sitekey は koetomo.fun に紐づいているため、プロキシのドメインでは登録・ログインができません。ブラウザ側に日本出口を設定して koetomo.fun を直接開く必要があります(relay/README.md の方法D)。");
+})();
+</script></body></html>`;
+    res.writeHead(200, [["content-type", "text/html; charset=utf-8"], ["content-length", String(Buffer.byteLength(body))], ["cache-control", "no-store"]]);
+    return res.end(body);
+  }
   if (u === "/__cache") {
     const items = [...assetCache.entries()].map(([k, v]) => ({
       key: k, kb: Math.round(v.body.length / 1024), ct: v.ct,

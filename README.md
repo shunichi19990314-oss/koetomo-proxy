@@ -14,6 +14,7 @@ Render の無料 Web サービスとしてデプロイし、ブラウザでは `
 | `/__hub` | リバーストンネルのハブ状態(日本のマシンの接続台数・待機ソケット数・確立中トンネル数)を JSON で返す |
 | **📦 同梱アセット(vendor)** | アプリ本体 `/static/js/main.<hash>.js` は**約5MB**あり、無料の公開プロキシは HTML(1.4KB)は返せても 5MB で切れる/数分で死ぬものがほとんどです(実測)。このファイルは**名前に内容ハッシュが入っている=中身が変わればURLも変わる**ため、`vendor/koetomo/` に同梱して**プロキシを一切使わずに Render から直接配信**します(実測 **404ms**)。これで「HTML と API の JSON だけがプロキシ経由」になり、遅くて不安定な日本出口でもアプリが起動します。撮り直しは `npm run vendor` |
 | **静的アセットのキャッシュ** | 約5MBのアプリ本体 `/static/js/main.<hash>.js` は**ファイル名に内容ハッシュ**が入っているので、一度取得したらメモリに保持して2回目以降を瞬時にします(`cache-control: immutable` でブラウザ側にも強くキャッシュ)。遅い公開プロキシ経由でも**初回だけ我慢すれば以降は快適**です。状態は `/__cache`、上限は `ASSET_CACHE_MB`(既定128MB)・TTL は `ASSET_CACHE_TTL`(既定6時間)。**API や HTML は絶対にキャッシュしません**(ユーザ依存のため) |
+| `/__diag` | **ブラウザ上で reCAPTCHA が通るかを検査するページ**。声ともは登録・ログインに reCAPTCHA v3(sitekey は `koetomo.fun` に紐付け)+ FingerprintJS を必須にしており、プロキシのドメインではトークンが発行/検証されないことがあります。「登録エラー」の原因を切り分けるために使います |
 | `/__cache` | アセットキャッシュの状態(エントリ数・使用バイト・ヒット率・保持中のファイル一覧) |
 | `/__relay` | 日本出口プロキシ候補の実測状態(ステータス・応答時間・出口IP・国・無効化フラグ)。`?recheck=1` で即実測、`?rotate=1` で強制切替 |
 | **マルチホスト対応(API が別ドメイン)** | 声ともは Web本体(`koetomo.fun`)とは別に **API を `a.koetomo.fun` / `api.meetscom.com`** で叩きます(同じ ALB なので同様に 403)。これらを `/__up/<host>/<path>` に書き換えて自分経由にし、**同一オリジン化(CORS も発生しない)**。難読化JSでホスト名が `'https://mtrcs.koetom'+'o.fun'` のように**分断されているケースも断片単位で書き換え**。素のホスト名・`https://`・`//`・`wss://`・`\/\/`・`%3A%2F%2F` の全形式に対応 |
@@ -242,6 +243,45 @@ node test/live-tunnel-check.js  # 実物の koetomo.fun に対して疎通確認
 - バイナリ(画像/音声/フォント等)は無加工・ストリーム素通し。テキストは 25MB までバッファ書き換え
 - absolute-form (`GET http://example.com/`) は 400 で拒否 → オープンプロキシ化を防止
 - リレー (`relay/relay.js`) も同様に absolute-form/CONNECT とも **Basic認証 + ホスト許可リスト + ポート 80/443 限定**
+
+## ⚠️ 既知の制限: 登録・ログイン(reCAPTCHA)
+
+同梱の JS バンドル(`vendor/koetomo/static/js/main.768aa9e3.js`)を解析した結果、
+声ともの**新規登録とログインは reCAPTCHA v3 のトークンを必須**にしています。
+
+```js
+// 登録リクエストのペイロード(実物のバンドルから抽出)
+{ email, password, recaptchaToken, browserFingerPrint }
+{ name, sex, birthday, recaptchaToken, browserFingerPrint, state }
+// API 側のエラーコード
+"recaptcha_verify_err" / "login_ip_address_ban" / "ip_address_ban"
+// 設定
+REACT_APP_RECAPTCHA_KEY = 6Lc5EAUq…(koetomo.fun に登録された sitekey)
+REACT_APP_FINGERPRINTJS_ENDPOINT = https://mtrcs.koetomo.fun
+```
+
+**reCAPTCHA v3 の sitekey はドメインに紐づいている**ため、
+`https://koetomo-proxy.onrender.com` のような別ドメインではトークンの発行または検証に失敗し、
+「登録エラー エラーが発生しました。」になります。これはプロキシ側のバグではなく、
+reCAPTCHA の仕様上**リバースプロキシ方式では回避できません**(回避するには reCAPTCHA を
+改ざんするしかなく、それは行いません)。
+
+**実際に通るかどうかは `/__diag` をブラウザで開けば10秒で確認できます。**
+
+### 登録・ログインまで行いたい場合
+
+ブラウザが**本当に `koetomo.fun` 上にいる**必要があります。つまり
+「Render のプロキシ経由」ではなく、**ブラウザ/OS レベルの日本出口**を使ってください:
+
+| 方法 | 手順 | 備考 |
+|---|---|---|
+| **方法D: 公開プロキシをブラウザに設定** | `relay/README.md` → 方法D。OS または Firefox のプロキシ設定に日本の公開プロキシを入れ、`https://koetomo.fun` を直接開く | ドメインが本物なので reCAPTCHA も FingerprintJS も正常に働きます。5MB の JS を落とせるプロキシが必要です(`npm run scan:jp` で探せます) |
+| **VPN(日本出口)** | 日本サーバのある VPN に繋いで `koetomo.fun` を直接開く | 最も安定。無料枠で日本を選べるものは少ないため実質有料 or VPN Gate |
+| **方法A: リバーストンネル** | 日本の常時ONマシンで `relay/reverse-tunnel.js` を起動 | 帯域が安定するので 5MB の JS も確実に読めます。ただし**ドメインは Render のままなので reCAPTCHA の問題は残ります** |
+
+> 補足: Firefox は FingerprintJS をスキップする実装になっています
+> (バンドル内に `'Firefox' != browser && (fingerprint = await …)` の分岐があります)。
+> ただし reCAPTCHA は Firefox でも必須なので、これだけで登録が通るわけではありません。
 
 ## 制限・注意
 
