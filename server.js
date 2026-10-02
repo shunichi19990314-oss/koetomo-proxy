@@ -858,6 +858,7 @@ async function proxyHttp(req, res) {
   }
 
   let upRes = null;
+  let preBuf = null;   // 大容量アセットを「最後まで読み切れた」ことを確認してから応答するための退避
   let attempt = 0;
   const MAX_RELAY_ATTEMPTS = POOL.enabled && !TUNNEL ? Math.min(4, POOL.size + 1) : 1;
   while (true) {
@@ -886,6 +887,24 @@ async function proxyHttp(req, res) {
           const next = POOL.reportFailure(`HTTP ${upRes.status} (${upRes.headers.get("server") || "?"})`);
           log(`upstream ${upRes.status} via ${RELAY?.label} → 日本出口を回転: 次の候補 ${next?.label || "(なし)"} [${attempt + 1}/${MAX_RELAY_ATTEMPTS}]`);
           if (next) { attempt++; continue; }
+        }
+      }
+      // ── 大容量アセットは「最後まで読み切れるか」を先に確認する ──
+      // 公開プロキシは HTML(1.4KB)は返せても 5MB のアプリ本体で切れることが多く、
+      // 応答ヘッダを送った後に切れるとリトライできず 500 になります。
+      // そこでキャッシュ対象かつテキスト(js/css等)のときは本文を先に全部読み、
+      // 失敗したら次の日本出口に切り替えてやり直します。
+      if (cacheKey && POOL.enabled && !TUNNEL && upRes.status === 200 &&
+          isRewritableType(upRes.headers.get("content-type") || "")) {
+        try {
+          preBuf = await readLimited(upRes.body, TEXT_MAX);
+        } catch (e) {
+          preBuf = null;
+          if (attempt < MAX_RELAY_ATTEMPTS) {
+            const next = POOL.reportFailure("asset body: " + (e?.cause?.code || e?.message));
+            log(`アセット取得失敗 ${tgt.path} via ${RELAY?.label}: ${e?.cause?.code || e?.message} → 日本出口を回転: ${next?.label || "(なし)"} [${attempt + 1}/${MAX_RELAY_ATTEMPTS}]`);
+            if (next) { attempt++; continue; }
+          }
         }
       }
       break;
@@ -940,7 +959,8 @@ async function proxyHttp(req, res) {
 
   // ── 書き換え可能なテキスト(html/js/css/json/svg/xml…) ──
   if (isRewritableType(upCt)) {
-    const { chunks, size, overflow, reader } = await readLimited(upRes.body, TEXT_MAX);
+    // リトライ確認のために既に読んである場合はそれを使い、まだならここで読む
+    const { chunks, size, overflow, reader } = preBuf || await readLimited(upRes.body, TEXT_MAX);
     if (!overflow) {
       const out = Buffer.from(rewrite(Buffer.concat(chunks, size).toString("utf8")), "utf8");
       const headers = buildResponseHeaders(upRes, rewrite, origin, "rewrite");

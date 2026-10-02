@@ -120,9 +120,11 @@ class RelayPool {
     const c = this.active();
     if (!c) return null;
     c.failures++;
-    c.status = why || "ERR";
-    c.lastCheck = Date.now();
-    if (c.failures >= 3) {
+    // 注意: c.status は「定期実測の結果」なので壊さない(壊すと並べ替えが正しくできなくなる)。
+    // リクエスト時の失敗理由は lastError に separately 記録する。
+    c.lastError = String(why || "").slice(0, 120);
+    c.lastErrorAt = Date.now();
+    if (c.failures >= 4) {
       c.disabled = true;
       this.log(`[relay-pool] ${c.label} を無効化 (${why}) — 残り ${this.list.filter((x) => !x.disabled).length}/${this.list.length}`);
     } else {
@@ -153,13 +155,25 @@ class RelayPool {
     const run = (async () => {
       const results = await Promise.all(this.list.map((c) => this.probe(c)));
       // 並べ替え: 有効(200/3xx) > 403(出口IPブロック) > エラー、同一区分内は応答時間順
+      /**
+       * 0 が最良。公開プロキシは「HTML(1.4KB)は 200 なのに 5MB のアプリ本体は落とせない」ものが多く、
+       * それを最上位に選ぶとページが真っ白になるため、DEEP_PROBE 有効時は
+       * 「アプリ本体を実際に落とせた候補(deep=ok)」だけを 0 にする。
+       */
       const rank = (c) => {
-        if (c.status === null) return 4;
-        if (/^ERR/.test(String(c.status))) return 5;
-        if (c.status === 403 || c.status === 401) return 3;
-        if (c.status >= 500) return 2;
-        // 200 は返るがアプリ本体(数MBのJS)を落とせない候補は一段下げる
-        if (DEEP_PROBE && c.deep && c.deep !== "ok" && c.deep !== "no-js") return 1;
+        if (c.disabled) return 9;
+        if (c.status === null || c.status === undefined) return 6;   // 未測定
+        if (/^ERR/.test(String(c.status))) return 7;                 // 到達不可
+        if (typeof c.status !== "number") return 5;                  // 異常(文字列が入っている等)
+        if (c.status === 403 || c.status === 401) return 4;          // 出口IPがブロックされている
+        if (c.status >= 500) return 3;
+        if (c.status >= 400) return 2;
+        if (DEEP_PROBE) {
+          if (c.deep === "ok") return 0;                             // ★ アプリ本体を落とせる
+          if (c.deep === "no-js") return 1;
+          if (c.deep === null || c.deep === undefined) return 1;      // 未検査(まだ判断できない)
+          return 3;                                                   // 大容量を落とせない=実用にならない
+        }
         return 0;
       };
       this.list.sort((a, b) => (rank(a) - rank(b)) || ((b.deepKbps ?? 0) - (a.deepKbps ?? 0)) || ((a.ms ?? 1e9) - (b.ms ?? 1e9)));
@@ -257,14 +271,18 @@ class RelayPool {
       } catch { /* 出口IPが取れなくても判定には影響させない */ }
     }
     c.lastCheck = Date.now();
-    c.failures = /^ERR/.test(String(c.status)) ? c.failures + 1 : 0;
-    if (c.failures >= 3) c.disabled = true;
+
     // 大容量アセット検査(有効時のみ)。200 が返るのにアプリ本体を落とせない候補を弾く
-    if (DEEP_PROBE && !/^ERR/.test(String(c.status)) && c.status !== 403 && c.status !== 401) {
+    if (DEEP_PROBE && typeof c.status === "number" && c.status < 400) {
       await this.deepProbe(c, dispatcher);
-      if (c.deep && c.deep !== "ok" && c.deep !== "no-js") c.failures += 2;
-      if (c.failures >= 3) c.disabled = true;
     }
+
+    // 健全性判定: 実測で 200 系 かつ(deep 無効 or アプリ本体を落とせた)
+    // → 健全なら失敗カウントと無効化を解除する(死んでいた候補が復帰したら自動で戻す)
+    const deepOk = !DEEP_PROBE || c.deep == null || c.deep === "ok" || c.deep === "no-js";
+    const healthy = typeof c.status === "number" && c.status < 400 && deepOk;
+    if (healthy) { c.failures = 0; c.disabled = false; }
+    else { c.failures++; if (c.failures >= 2) c.disabled = true; }
     return c;
   }
 
@@ -279,6 +297,7 @@ class RelayPool {
       candidates: this.list.map((c) => ({
         label: c.label, status: c.status, ms: c.ms, egressIp: c.egressIp, country: c.country,
         org: c.org, asn: c.asn, failures: c.failures, disabled: c.disabled,
+        lastError: c.lastError || null,
         deep: c.deep || null, deepMB: c.deepBytes ? +(c.deepBytes / 1048576).toFixed(2) : null,
         deepSec: c.deepMs ? +(c.deepMs / 1000).toFixed(1) : null, deepKBps: c.deepKbps || null,
         lastCheck: c.lastCheck ? new Date(c.lastCheck).toISOString() : null,
